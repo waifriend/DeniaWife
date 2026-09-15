@@ -1,18 +1,10 @@
 import asyncio
 import os
-
 import aiohttp
 import discord
 import libsql
 from discord import app_commands
 from discord.ext import commands
-
-# ── Auto-Translate Channel Mapping ──────────────────────────────────
-AUTO_TRANSLATE_CHANNELS = {
-    "english": "en",
-    "한국인": "ko",
-    "русский": "ru",
-}
 
 # ── Supported Languages Mapping ─────────────────────────────────────
 SUPPORTED_LANGS = {
@@ -68,16 +60,25 @@ def get_turso_conn():
 
 
 def _init_db_sync():
-    """Creates the user_languages table in Turso if it does not exist."""
+    """Creates tables in Turso if they do not exist."""
     conn = get_turso_conn()
     if not conn:
         print("Warning: Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN in environment.")
         return
 
     with conn:
+        # Table for individual user preferences
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_languages (
                 user_id    INTEGER PRIMARY KEY,
+                lang_code  TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Table for auto-translate channel bindings
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS channel_languages (
+                channel_id INTEGER PRIMARY KEY,
                 lang_code  TEXT NOT NULL,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -116,6 +117,43 @@ async def set_user_language(user_id: int, lang_code: str):
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (user_id, lang_code),
+            )
+            conn.commit()
+
+    await asyncio.to_thread(_update)
+
+
+async def get_channel_language(channel_id: int) -> str | None:
+    def _query():
+        conn = get_turso_conn()
+        if not conn:
+            return None
+        with conn:
+            cursor = conn.execute(
+                "SELECT lang_code FROM channel_languages WHERE channel_id = ?",
+                (channel_id,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    return await asyncio.to_thread(_query)
+
+
+async def set_channel_language(channel_id: int, lang_code: str):
+    def _update():
+        conn = get_turso_conn()
+        if not conn:
+            return
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO channel_languages (channel_id, lang_code)
+                VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    lang_code = excluded.lang_code,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (channel_id, lang_code),
             )
             conn.commit()
 
@@ -201,11 +239,10 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    channel_name = getattr(message.channel, "name", "").lower()
+    # Look up dynamic target language bound to this channel
+    target_lang = await get_channel_language(message.channel.id)
 
-    if channel_name in AUTO_TRANSLATE_CHANNELS:
-        target_lang = AUTO_TRANSLATE_CHANNELS[channel_name]
-
+    if target_lang:
         translated, detected_code, confidence = await translate_text(
             message.content, target_lang
         )
@@ -256,6 +293,50 @@ async def language_autocomplete(
 
 
 # ── Slash Commands ──────────────────────────────────────────────────
+@bot.tree.command(
+    name="setchannellanguage",
+    description="Set auto-translation target language for a specific channel.",
+)
+@app_commands.describe(
+    channel="Select the channel to bind",
+    language="Type to search the target language",
+)
+@app_commands.autocomplete(language=language_autocomplete)
+@app_commands.default_permissions(manage_channels=True)
+async def setchannellanguage(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    language: str,
+):
+    lang_code = language.strip()
+
+    if lang_code not in SUPPORTED_LANGS:
+        matched_code = next(
+            (
+                code
+                for code, name in SUPPORTED_LANGS.items()
+                if name.lower() == lang_code.lower()
+            ),
+            None,
+        )
+        if matched_code:
+            lang_code = matched_code
+        else:
+            await interaction.response.send_message(
+                f"Invalid language selection: `{language}`. Please select a valid language from the list.",
+                ephemeral=True,
+            )
+            return
+
+    lang_name = SUPPORTED_LANGS[lang_code]
+    await set_channel_language(channel.id, lang_code)
+
+    await interaction.response.send_message(
+        f"Channel {channel.mention} will now auto-translate non-`{lang_name}` messages into **{lang_name}** (`{lang_code}`).",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(
     name="setlanguage",
     description="Set the language you want messages translated into.",
