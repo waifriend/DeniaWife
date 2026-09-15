@@ -60,6 +60,10 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
+    # Drop outdated tables to fix missing columns
+    conn.execute("DROP TABLE IF EXISTS channel_languages")
+    conn.execute("DROP TABLE IF EXISTS user_languages")
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channel_languages (
