@@ -36,6 +36,14 @@ LANGUAGES = {
     "Hindi (हिन्दी)": "hi",
 }
 
+# Role-based default language mapping (lowercase for case-insensitive matching)
+ROLE_LANGUAGES = {
+    "korean": "ko",
+    "english": "en",
+    "chinese": "zh-Hans",
+    "russian": "ru",
+}
+
 # Regex to detect custom Discord Nitro emotes (<:name:id> or <a:name:id>)
 CUSTOM_EMOTE_REGEX = re.compile(r"<a?:[a-zA-Z0-9_]+:\d+>")
 
@@ -123,6 +131,31 @@ def get_user_language_db(user_id: int) -> str | None:
 
 
 # ------------------------------------------------------------------------------
+# User Language Resolution (DB Preference -> Server Role -> Fallback)
+# ------------------------------------------------------------------------------
+
+
+def get_effective_user_language(
+    user: discord.User | discord.Member,
+) -> str:
+    """Determines target language: /setlanguage > Server Role > English fallback."""
+    # 1. Priority 1: Check manual database preference (/setlanguage)
+    db_lang = get_user_language_db(user.id)
+    if db_lang:
+        return db_lang
+
+    # 2. Priority 2: Check server roles if user is a Member in a guild
+    if isinstance(user, discord.Member):
+        for role in user.roles:
+            role_name_lower = role.name.strip().lower()
+            if role_name_lower in ROLE_LANGUAGES:
+                return ROLE_LANGUAGES[role_name_lower]
+
+    # 3. Priority 3: Fallback default
+    return "en"
+
+
+# ------------------------------------------------------------------------------
 # Emote Protection & Translation Logic
 # ------------------------------------------------------------------------------
 
@@ -204,10 +237,11 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
+intents.members = True  # Required to resolve member roles cleanly
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Autocomplete function for language parameters
+
 async def language_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
@@ -225,7 +259,6 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-# Owner-only command sync
 @bot.command()
 @commands.is_owner()
 async def sync(ctx: commands.Context):
@@ -283,23 +316,30 @@ async def set_user_language(
     description="Check your current personal target language setting",
 )
 async def my_language(interaction: discord.Interaction):
-    lang_code = get_user_language_db(interaction.user.id)
-    if lang_code:
-        lang_name = next(
-            (k for k, v in LANGUAGES.items() if v == lang_code), lang_code
+    db_lang = get_user_language_db(interaction.user.id)
+    effective_lang = get_effective_user_language(interaction.user)
+
+    lang_name = next(
+        (k for k, v in LANGUAGES.items() if v == effective_lang), effective_lang
+    )
+
+    if db_lang:
+        msg = f"Your target language is manually set to **{lang_name}** (`{effective_lang}`)."
+    elif (
+        isinstance(interaction.user, discord.Member)
+        and any(
+            r.name.strip().lower() in ROLE_LANGUAGES
+            for r in interaction.user.roles
         )
-        await interaction.response.send_message(
-            f"Your personal target language is currently set to **{lang_name}** (`{lang_code}`).",
-            ephemeral=True,
-        )
+    ):
+        msg = f"Your target language is set to **{lang_name}** (`{effective_lang}`) based on your server roles."
     else:
-        await interaction.response.send_message(
-            "You have not set a personal target language yet. Use `/setlanguage` to choose one.",
-            ephemeral=True,
-        )
+        msg = f"Your target language is defaulting to **English** (`en`). Use `/setlanguage` to override it."
+
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
-# Context Menu Apps (Right click message -> Apps -> Translate)
+# Apps Menu Translate (Right-click message -> Apps -> Translate)
 @bot.tree.context_menu(name="Translate")
 async def translate_context_menu(
     interaction: discord.Interaction, message: discord.Message
@@ -310,7 +350,8 @@ async def translate_context_menu(
         )
         return
 
-    target_lang = get_user_language_db(interaction.user.id) or "en"
+    # Automatically checks /setlanguage DB preference, then roles, then fallback
+    target_lang = get_effective_user_language(interaction.user)
     translated, src_lang, score = await translate_text(
         message.content, target_lang
     )
@@ -348,14 +389,13 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Check if channel has auto-translate configured
+    # Channel auto-translation check
     target_lang = get_channel_language_db(message.channel.id)
     if target_lang:
         translated, src_lang, confidence = await translate_text(
             message.content, target_lang
         )
 
-        # Only post embed if source language is different from target language
         if src_lang.lower() != target_lang.lower():
             embed = discord.Embed(
                 description=translated, color=discord.Color.green()
@@ -384,12 +424,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     try:
         message = await channel.fetch_message(payload.message_id)
+        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
         user = await bot.fetch_user(payload.user_id)
 
         if user.bot or not message.content:
             return
 
-        target_lang = get_user_language_db(user.id) or "en"
+        # Get Member object if in a guild to accurately read roles
+        member = guild.get_member(user.id) if guild else user
+        target_lang = get_effective_user_language(member or user)
+
         translated, src_lang, confidence = await translate_text(
             message.content, target_lang
         )
