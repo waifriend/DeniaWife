@@ -41,11 +41,21 @@ ROLE_LANGUAGES = {
     "korean": "ko",
     "english": "en",
     "chinese": "zh-Hans",
+    "simplified chinese": "zh-Hans",
+    "traditional chinese": "zh-Hant",
     "russian": "ru",
 }
 
-# Regex to detect custom Discord Nitro emotes (<:name:id> or <a:name:id>)
-CUSTOM_EMOTE_REGEX = re.compile(r"<a?:[a-zA-Z0-9_]+:\d+>")
+# Flag reactions for in-chat public translation
+FLAG_TRANSLATIONS = {
+    "🇹🇼": "zh-Hant",
+    "🇰🇷": "ko",
+    "🇷🇺": "ru",
+    "🇺🇸": "en",
+}
+
+# Regex matching custom Nitro emotes (<:name:id>) and standard shortcodes (:name:)
+EMOTE_REGEX = re.compile(r"(<a?:[a-zA-Z0-9_]+:\d+>|:[a-zA-Z0-9_]+:)")
 
 # ------------------------------------------------------------------------------
 # Database Helpers (Turso / libSQL)
@@ -60,10 +70,6 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
-    # Drop outdated tables to fix missing columns
-    conn.execute("DROP TABLE IF EXISTS channel_languages")
-    conn.execute("DROP TABLE IF EXISTS user_languages")
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channel_languages (
@@ -77,6 +83,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_languages (
             user_id TEXT PRIMARY KEY,
             target_lang TEXT NOT NULL
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_help_seen (
+            user_id TEXT PRIMARY KEY
         )
     """
     )
@@ -134,61 +147,77 @@ def get_user_language_db(user_id: int) -> str | None:
     return row[0] if row else None
 
 
+def has_user_seen_help(user_id: int) -> bool:
+    """Checks if the user has used /help before."""
+    conn = get_db_connection()
+    res = conn.execute(
+        "SELECT 1 FROM user_help_seen WHERE user_id = ?", (str(user_id),)
+    )
+    row = res.fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_user_seen_help(user_id: int):
+    """Marks that a user has seen the /help command prompt."""
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT OR IGNORE INTO user_help_seen (user_id) VALUES (?)",
+        (str(user_id),),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ------------------------------------------------------------------------------
-# User Language Resolution (DB Preference -> Server Role -> Fallback)
+# Language Helpers & Resolution Logic
 # ------------------------------------------------------------------------------
 
 
-def get_effective_user_language(
-    user: discord.User | discord.Member,
-) -> str:
+def get_clean_lang_name(code: str) -> str:
+    """Returns the main display name for a language code (e.g., 'Korean')."""
+    for name, lang_code in LANGUAGES.items():
+        if lang_code.lower() == code.lower():
+            return name.split(" (")[0]
+    return code.upper()
+
+
+def get_effective_user_language(user: discord.User | discord.Member) -> str:
     """Determines target language: /setlanguage > Server Role > English fallback."""
-    # 1. Priority 1: Check manual database preference (/setlanguage)
     db_lang = get_user_language_db(user.id)
     if db_lang:
         return db_lang
 
-    # 2. Priority 2: Check server roles if user is a Member in a guild
     if isinstance(user, discord.Member):
         for role in user.roles:
             role_name_lower = role.name.strip().lower()
             if role_name_lower in ROLE_LANGUAGES:
                 return ROLE_LANGUAGES[role_name_lower]
 
-    # 3. Priority 3: Fallback default
     return "en"
 
 
 # ------------------------------------------------------------------------------
-# Emote Protection & Translation Logic
+# HTML Emote Protection & Azure API Integration
 # ------------------------------------------------------------------------------
 
 
-def protect_emotes(text: str) -> tuple[str, dict[str, str]]:
-    """Replaces custom Discord emotes with non-translatable placeholders."""
-    placeholders = {}
-
-    def replace(match):
-        token = f"EMOTETOKEN{len(placeholders)}"
-        placeholders[token] = match.group(0)
-        return token
-
-    protected_text = CUSTOM_EMOTE_REGEX.sub(replace, text)
-    return protected_text, placeholders
+def protect_emotes_html(text: str) -> str:
+    """Wraps all emote types in HTML tags so Azure ignores them."""
+    return EMOTE_REGEX.sub(r'<span class="notranslate">\1</span>', text)
 
 
-def restore_emotes(text: str, placeholders: dict[str, str]) -> str:
-    """Restores original custom emotes after translation."""
-    for token, original_emote in placeholders.items():
-        pattern = re.compile(
-            r"\s*".join(re.escape(c) for c in token), re.IGNORECASE
-        )
-        text = pattern.sub(original_emote, text)
-    return text
+def restore_emotes_html(text: str) -> str:
+    """Strips the protection HTML tags after translation."""
+    return (
+        text.replace('<span class="notranslate">', "")
+        .replace("</span>", "")
+        .replace('<span class="notranslate" >', "")
+    )
 
 
 async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
-    """Translates text using Azure AI Translator REST API v3.0."""
+    """Translates text using Azure AI Translator REST API v3.0 with HTML protection."""
     if not AZURE_TRANSLATE_KEY or not AZURE_TRANSLATE_REGION:
         return (
             "Translation error: Missing credentials in .env",
@@ -196,10 +225,9 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
             0,
         )
 
-    # Protect Nitro emotes before sending payload
-    protected_text, placeholders = protect_emotes(text)
+    protected_text = protect_emotes_html(text)
 
-    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={target_lang}"
+    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={target_lang}&textType=html"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_TRANSLATE_KEY.strip(),
         "Ocp-Apim-Subscription-Region": AZURE_TRANSLATE_REGION.strip(),
@@ -213,9 +241,7 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
                 if resp.status == 200:
                     data = await resp.json()
                     raw_translated = data[0]["translations"][0]["text"]
-
-                    # Restore emotes in translation response
-                    translated = restore_emotes(raw_translated, placeholders)
+                    translated = restore_emotes_html(raw_translated)
 
                     detected_info = data[0].get("detectedLanguage", {})
                     detected_code = detected_info.get("language", "Unknown")
@@ -234,6 +260,32 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
         return f"Translation error: {e}", "Unknown", 0
 
 
+def build_translation_embed(
+    author: discord.User | discord.Member,
+    translated_text: str,
+    src_code: str,
+    target_code: str,
+    confidence: int,
+) -> discord.Embed:
+    """Builds the custom purple embed card for translated messages."""
+    target_name = get_clean_lang_name(target_code)
+    src_name = get_clean_lang_name(src_code)
+
+    embed = discord.Embed(
+        description=f"**{target_name}:**\n{translated_text}",
+        color=discord.Color.purple(),
+    )
+    embed.set_author(
+        name=author.display_name, icon_url=author.display_avatar.url
+    )
+    embed.set_thumbnail(url=author.display_avatar.url)
+    embed.set_footer(
+        text=f"Original language: {src_name} ({src_code.lower()}) • Confidence: {confidence}% • Provider: Azure AI"
+    )
+
+    return embed
+
+
 # ------------------------------------------------------------------------------
 # Bot Setup
 # ------------------------------------------------------------------------------
@@ -241,7 +293,7 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
-intents.members = True  # Required to resolve member roles cleanly
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -276,6 +328,77 @@ async def sync(ctx: commands.Context):
 
 
 @bot.tree.command(
+    name="help",
+    description="View instructions and guide for using the Translator bot",
+)
+async def help_command(interaction: discord.Interaction):
+    is_first_time = not has_user_seen_help(interaction.user.id)
+
+    embed = discord.Embed(
+        title="🌐 Translator Bot Guide",
+        description="Here is how to use translation features across the server!",
+        color=discord.Color.purple(),
+    )
+
+    # First-Time Multilingual Prompt Banner
+    if is_first_time:
+        first_time_msg = (
+            "🌍 **Select your preferred language / 請選擇您的首選語言 / 선호하는 언어를 선택하세요 / Выберите ваш язык:**\n\n"
+            "👉 Please run **`/setlanguage`** to set your default language!\n"
+            "• **EN:** Use `/setlanguage` to pick your preferred translation target.\n"
+            "• **ZH-TW:** 請輸入 `/setlanguage` 來選擇您的預設翻譯語言。\n"
+            "• **KO:** `/setlanguage` 명령어로 기본 번역 언어를 설정하세요.\n"
+            "• **RU:** Используйте `/setlanguage` для выбора основного языка."
+        )
+        embed.add_field(
+            name="✨ First-Time Setup / 語言設定 guidance",
+            value=first_time_msg,
+            inline=False,
+        )
+        mark_user_seen_help(interaction.user.id)
+
+    embed.add_field(
+        name="👤 Personal Target Language Settings",
+        value=(
+            "• **`/setlanguage`**: Override your preferred translation language.\n"
+            "• **`/mylanguage`**: Check your current active target language.\n"
+            "• **Role Auto-Detection**: If you haven't set a language manually, the bot automatically checks your server roles (e.g., *Korean*, *Traditional Chinese*, *Russian*, *English*) to pick your default!"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🚩 Quick Flag Reactions (Public)",
+        value=(
+            "React to any message with a flag to translate it directly in chat for everyone:\n"
+            "• 🇹🇼 ➔ **Traditional Chinese** (`zh-Hant`)\n"
+            "• 🇰🇷 ➔ **Korean** (`ko`)\n"
+            "• 🇷🇺 ➔ **Russian** (`ru`)\n"
+            "• 🇺🇸 ➔ **English** (`en`)\n"
+            "• 🌐 ➔ Sends a **private DM** translation using your personal target language."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🖱️ Context Menu Translation",
+        value="Right-click any message ➔ **Apps** ➔ **Translate** to receive a private, ephemeral translation card.",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Admin Commands",
+        value="• **`/setchannellanguage`**: Set automatic channel-wide translation for all non-bot messages.",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Powered by Azure AI • Emote & Short Message Filter Active"
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
     name="setchannellanguage",
     description="Set auto-translation language for a channel",
 )
@@ -287,9 +410,7 @@ async def set_channel_language(
     language: str,
 ):
     set_channel_language_db(channel.id, language)
-    lang_name = next(
-        (k for k, v in LANGUAGES.items() if v == language), language
-    )
+    lang_name = get_clean_lang_name(language)
     await interaction.response.send_message(
         f"Auto-translation for {channel.mention} set to **{lang_name}** (`{language}`).",
         ephemeral=True,
@@ -306,9 +427,7 @@ async def set_user_language(
     language: str,
 ):
     set_user_language_db(interaction.user.id, language)
-    lang_name = next(
-        (k for k, v in LANGUAGES.items() if v == language), language
-    )
+    lang_name = get_clean_lang_name(language)
     await interaction.response.send_message(
         f"Your personal translation language has been set to **{lang_name}** (`{language}`).",
         ephemeral=True,
@@ -322,10 +441,7 @@ async def set_user_language(
 async def my_language(interaction: discord.Interaction):
     db_lang = get_user_language_db(interaction.user.id)
     effective_lang = get_effective_user_language(interaction.user)
-
-    lang_name = next(
-        (k for k, v in LANGUAGES.items() if v == effective_lang), effective_lang
-    )
+    lang_name = get_clean_lang_name(effective_lang)
 
     if db_lang:
         msg = f"Your target language is manually set to **{lang_name}** (`{effective_lang}`)."
@@ -354,31 +470,24 @@ async def translate_context_menu(
         )
         return
 
-    # Automatically checks /setlanguage DB preference, then roles, then fallback
     target_lang = get_effective_user_language(interaction.user)
     translated, src_lang, score = await translate_text(
         message.content, target_lang
     )
 
-    embed = discord.Embed(
-        title="Translation Result",
-        description=translated,
-        color=discord.Color.blue(),
-    )
-    embed.add_field(
-        name="Source",
-        value=f"{src_lang.upper()} ({score}% confidence)",
-        inline=True,
-    )
-    embed.add_field(
-        name="Target", value=target_lang.upper(), inline=True
+    embed = build_translation_embed(
+        author=message.author,
+        translated_text=translated,
+        src_code=src_lang,
+        target_code=target_lang,
+        confidence=score,
     )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ------------------------------------------------------------------------------
-# Events (Auto-Translate & Reaction Listener)
+# Events (Auto-Translate & Reaction Listeners)
 # ------------------------------------------------------------------------------
 
 
@@ -387,13 +496,17 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Skip messages containing only custom emotes and no actual text
-    clean_text = CUSTOM_EMOTE_REGEX.sub("", message.content).strip()
-    if not clean_text:
+    # Skip translation if message is a bot command (e.g. !sync)
+    if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # Channel auto-translation check
+    # Strip emotes to check remaining text length
+    clean_text = EMOTE_REGEX.sub("", message.content).strip()
+    if len(clean_text) <= 3:
+        await bot.process_commands(message)
+        return
+
     target_lang = get_channel_language_db(message.channel.id)
     if target_lang:
         translated, src_lang, confidence = await translate_text(
@@ -401,15 +514,12 @@ async def on_message(message: discord.Message):
         )
 
         if src_lang.lower() != target_lang.lower():
-            embed = discord.Embed(
-                description=translated, color=discord.Color.green()
-            )
-            embed.set_author(
-                name=message.author.display_name,
-                icon_url=message.author.display_avatar.url,
-            )
-            embed.set_footer(
-                text=f"Auto-translated ({src_lang.upper()} ➔ {target_lang.upper()})"
+            embed = build_translation_embed(
+                author=message.author,
+                translated_text=translated,
+                src_code=src_lang,
+                target_code=target_lang,
+                confidence=confidence,
             )
             await message.channel.send(embed=embed)
 
@@ -418,47 +528,64 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    # Respond to globe emoji reactions (🌐)
-    if str(payload.emoji) != "🌐":
+    emoji_str = str(payload.emoji)
+
+    if emoji_str not in FLAG_TRANSLATIONS and emoji_str != "🌐":
         return
 
     channel = bot.get_channel(payload.channel_id)
     if not channel:
-        return
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-        user = await bot.fetch_user(payload.user_id)
-
-        if user.bot or not message.content:
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except Exception:
             return
 
-        # Get Member object if in a guild to accurately read roles
-        member = guild.get_member(user.id) if guild else user
-        target_lang = get_effective_user_language(member or user)
+    try:
+        user = await bot.fetch_user(payload.user_id)
+        if user.bot:
+            return
 
-        translated, src_lang, confidence = await translate_text(
-            message.content, target_lang
-        )
+        message = await channel.fetch_message(payload.message_id)
+        if not message or not message.content:
+            return
 
-        embed = discord.Embed(
-            title="Private Translation Request",
-            description=translated,
-            color=discord.Color.purple(),
-        )
-        embed.set_author(
-            name=message.author.display_name,
-            icon_url=message.author.display_avatar.url,
-        )
-        embed.add_field(
-            name="Original", value=message.content, inline=False
-        )
-        embed.set_footer(
-            text=f"Detected Language: {src_lang.upper()} | Target: {target_lang.upper()}"
-        )
+        # Handle flag reactions (Public in-chat translation for everyone)
+        if emoji_str in FLAG_TRANSLATIONS:
+            target_lang = FLAG_TRANSLATIONS[emoji_str]
+            translated, src_lang, confidence = await translate_text(
+                message.content, target_lang
+            )
 
-        await user.send(embed=embed)
+            embed = build_translation_embed(
+                author=message.author,
+                translated_text=translated,
+                src_code=src_lang,
+                target_code=target_lang,
+                confidence=confidence,
+            )
+            await channel.send(embed=embed)
+
+        # Handle globe reaction (Private DM translation for reactor)
+        elif emoji_str == "🌐":
+            guild = (
+                bot.get_guild(payload.guild_id) if payload.guild_id else None
+            )
+            member = guild.get_member(user.id) if guild else user
+            target_lang = get_effective_user_language(member or user)
+
+            translated, src_lang, confidence = await translate_text(
+                message.content, target_lang
+            )
+
+            embed = build_translation_embed(
+                author=message.author,
+                translated_text=translated,
+                src_code=src_lang,
+                target_code=target_lang,
+                confidence=confidence,
+            )
+            await user.send(embed=embed)
+
     except Exception as e:
         print(f"Error handling reaction translation: {e}")
 
