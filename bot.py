@@ -1048,17 +1048,23 @@ async def sync(ctx: commands.Context):
     if ctx.guild is None:
         await ctx.send("This command can only be executed within a server.")
         return
+        
+    # 1. Backup your commands in memory
+    cmds = bot.tree.get_commands()
     
-    # 1. Wipe old global commands
+    # 2. Wipe global commands from Discord's servers to kill the ghosts
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync() 
     
-    # 2. Copy current code commands to this server and sync
+    # 3. Restore your commands in memory
+    for cmd in cmds:
+        bot.tree.add_command(cmd)
+        
+    # 4. Sync the clean list to your server
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
     
-    await ctx.send(f"🧹 Cleared global commands. Synced {len(synced)} clean command(s) to this server.")
-
+    await ctx.send(f"🧹 Cleared global ghosts. Synced {len(synced)} clean commands to this server.")
 
 # ------------------------------------------------------------------------------
 # Slash Commands
