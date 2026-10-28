@@ -1048,9 +1048,16 @@ async def sync(ctx: commands.Context):
     if ctx.guild is None:
         await ctx.send("This command can only be executed within a server.")
         return
+    
+    # 1. Wipe old global commands
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync() 
+    
+    # 2. Copy current code commands to this server and sync
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
-    await ctx.send(f"Synced {len(synced)} command(s) to this server.")
+    
+    await ctx.send(f"🧹 Cleared global commands. Synced {len(synced)} clean command(s) to this server.")
 
 
 # ------------------------------------------------------------------------------
