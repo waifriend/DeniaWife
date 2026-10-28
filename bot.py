@@ -1,7 +1,13 @@
 import asyncio
+import html
+import logging
+from collections import OrderedDict
 from datetime import datetime, timezone
 import os
 import re
+import time
+from typing import Optional
+
 import aiohttp
 import discord
 from discord import app_commands
@@ -10,13 +16,21 @@ from dotenv import load_dotenv
 import libsql
 
 # ------------------------------------------------------------------------------
-# 28. Environment Variable Validation
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("translation-bot")
+
+# ------------------------------------------------------------------------------
+# Environment Variable Validation
 # ------------------------------------------------------------------------------
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-AZURE_TRANSLATE_KEY = os.getenv("AZURE_TRANSLATE_KEY")
-AZURE_TRANSLATE_REGION = os.getenv("AZURE_TRANSLATE_REGION")
+DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
@@ -24,8 +38,7 @@ required_env = {
     "DISCORD_TOKEN": DISCORD_TOKEN,
     "TURSO_DATABASE_URL": TURSO_DATABASE_URL,
     "TURSO_AUTH_TOKEN": TURSO_AUTH_TOKEN,
-    "AZURE_TRANSLATE_KEY": AZURE_TRANSLATE_KEY,
-    "AZURE_TRANSLATE_REGION": AZURE_TRANSLATE_REGION,
+    "DEEPL_AUTH_KEY": DEEPL_AUTH_KEY,
 }
 missing_env = [k for k, v in required_env.items() if not v]
 if missing_env:
@@ -33,44 +46,88 @@ if missing_env:
         f"Missing required environment variables: {', '.join(missing_env)}"
     )
 
-AZURE_MONTHLY_LIMIT = 2_000_000
+# DeepL Free plan = 500_000 characters / month.
+# Pro is billed (not hard-capped). Soft local guard is configurable.
+_default_limit = "500000" if (DEEPL_AUTH_KEY or "").endswith(":fx") else "10000000"
+DEEPL_MONTHLY_LIMIT = int(os.getenv("DEEPL_MONTHLY_LIMIT", _default_limit))
 
+# Free keys end with ":fx" → use the free endpoint
+DEEPL_BASE_URL = (
+    "https://api-free.deepl.com"
+    if (DEEPL_AUTH_KEY or "").endswith(":fx")
+    else "https://api.deepl.com"
+)
+
+# DeepL language codes (case-insensitive on the API side; we normalise to upper).
+# Ordered by approximate usage so the first 25 fit in a Discord Select menu.
 LANGUAGES = {
-    "English": "en",
-    "Korean (한국어)": "ko",
-    "Japanese (日本語)": "ja",
-    "Spanish (Español)": "es",
-    "French (Français)": "fr",
-    "German (Deutsch)": "de",
-    "Chinese Simplified (简体中文)": "zh-Hans",
-    "Chinese Traditional (繁體中文)": "zh-Hant",
-    "Italian (Italiano)": "it",
-    "Portuguese (Português)": "pt",
-    "Russian (Русский)": "ru",
-    "Vietnamese (Tiếng Việt)": "vi",
-    "Thai (ไทย)": "th",
-    "Indonesian (Bahasa Indonesia)": "id",
-    "Arabic (العربية)": "ar",
-    "Hindi (हिन्दी)": "hi",
+    "English (American)": "EN-US",
+    "English (British)": "EN-GB",
+    "Korean (한국어)": "KO",
+    "Japanese (日本語)": "JA",
+    "Chinese Simplified (简体中文)": "ZH",
+    "Chinese Traditional (繁體中文)": "ZH-HANT",
+    "Spanish (Español)": "ES",
+    "French (Français)": "FR",
+    "German (Deutsch)": "DE",
+    "Russian (Русский)": "RU",
+    "Vietnamese (Tiếng Việt)": "VI",
+    "Thai (ไทย)": "TH",
+    "Indonesian (Bahasa Indonesia)": "ID",
+    "Portuguese (Brazilian)": "PT-BR",
+    "Portuguese (European)": "PT-PT",
+    "Italian (Italiano)": "IT",
+    "Arabic (العربية)": "AR",
+    "Hindi (हिन्दी)": "HI",
+    "Dutch (Nederlands)": "NL",
+    "Polish (Polski)": "PL",
+    "Turkish (Türkçe)": "TR",
+    "Ukrainian (Українська)": "UK",
+    "Swedish (Svenska)": "SV",
+    "Czech (Čeština)": "CS",
+    "Danish (Dansk)": "DA",
+    # Beyond Discord Select's 25-option limit — still available via /setlanguage
+    "Finnish (Suomi)": "FI",
+    "Greek (Ελληνικά)": "EL",
+    "Hungarian (Magyar)": "HU",
+    "Romanian (Română)": "RO",
+    "Bulgarian (Български)": "BG",
 }
 
-# 2. Strict language validation set
 VALID_LANGUAGE_CODES = set(LANGUAGES.values())
 
 ROLE_LANGUAGES = {
-    "korean": "ko",
-    "english": "en",
-    "chinese": "zh-Hans",
-    "simplified chinese": "zh-Hans",
-    "traditional chinese": "zh-Hant",
-    "russian": "ru",
+    "korean": "KO",
+    "english": "EN-US",
+    "chinese": "ZH",
+    "simplified chinese": "ZH",
+    "traditional chinese": "ZH-HANT",
+    "russian": "RU",
 }
 
 FLAG_TRANSLATIONS = {
-    "🇹🇼": "zh-Hant",
-    "🇰🇷": "ko",
-    "🇷🇺": "ru",
-    "🇺🇸": "en",
+    "🇹🇼": "ZH-HANT",
+    "🇰🇷": "KO",
+    "🇷🇺": "RU",
+    "🇺🇸": "EN-US",
+    "🇬🇧": "EN-GB",
+    "🇯🇵": "JA",
+    "🇨🇳": "ZH",
+    "🇪🇸": "ES",
+    "🇫🇷": "FR",
+    "🇩🇪": "DE",
+    "🇮🇹": "IT",
+    "🇧🇷": "PT-BR",
+    "🇵🇹": "PT-PT",
+    "🇻🇳": "VI",
+    "🇹🇭": "TH",
+    "🇮🇩": "ID",
+    "🇸🇦": "AR",
+    "🇮🇳": "HI",
+    "🇳🇱": "NL",
+    "🇵🇱": "PL",
+    "🇹🇷": "TR",
+    "🇺🇦": "UK",
 }
 
 EMOTE_REGEX = re.compile(r"(<a?:[a-zA-Z0-9_]+:\d+>|:[a-zA-Z0-9_]+:)")
@@ -78,11 +135,23 @@ CODE_BLOCK_REGEX = re.compile(r"```[\s\S]*?```|`[^`]+`")
 URL_REGEX = re.compile(r"https?://\S+|www\.\S+")
 MENTION_REGEX = re.compile(r"<@!?&?\d+>|<#\d+>")
 
-# Cache structure: {channel_id_str: {"defaults": [...], "rules": [...], "is_global": bool}}
-CHANNEL_CACHE: dict[str, dict] = {}
+# Bounded LRU-style cache for channel settings
+CHANNEL_CACHE_MAX = 512
+CHANNEL_CACHE: OrderedDict[str, dict] = OrderedDict()
 
-# 10. Bounded cache for prompted messages (cleans old entries to avoid unbounded memory growth)
+# Bounded cache for prompted messages (prevents duplicate 🌐 prompts)
 PROMPTED_MESSAGES: dict[int, float] = {}
+
+# Simple per-user / per-channel rate limiting (in-memory)
+# key → last timestamp
+USER_COOLDOWN: dict[int, float] = {}
+CHANNEL_COOLDOWN: dict[int, float] = {}
+USER_COOLDOWN_SECONDS = 3.0
+CHANNEL_COOLDOWN_SECONDS = 1.5
+COOLDOWN_PRUNE_AGE = 300.0  # drop entries older than 5 minutes
+
+# Created in setup_hook so it binds to the running event loop
+DEEPL_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 def clean_prompted_messages_cache(max_age_seconds: int = 3600):
@@ -96,12 +165,35 @@ def clean_prompted_messages_cache(max_age_seconds: int = 3600):
         PROMPTED_MESSAGES.pop(msg_id, None)
 
 
+def clean_cooldown_caches():
+    """Prune stale cooldown entries to avoid unbounded growth."""
+    now = time.monotonic()
+    for store in (USER_COOLDOWN, CHANNEL_COOLDOWN):
+        expired = [k for k, ts in store.items() if now - ts > COOLDOWN_PRUNE_AGE]
+        for k in expired:
+            store.pop(k, None)
+
+
 def invalidate_channel_cache(channel_id: int | str):
     CHANNEL_CACHE.pop(str(channel_id), None)
 
 
+def _check_cooldown(user_id: int, channel_id: int) -> bool:
+    """Return True if the action is allowed (not on cooldown)."""
+    now = time.monotonic()
+    last_user = USER_COOLDOWN.get(user_id, 0.0)
+    last_chan = CHANNEL_COOLDOWN.get(channel_id, 0.0)
+    if now - last_user < USER_COOLDOWN_SECONDS:
+        return False
+    if now - last_chan < CHANNEL_COOLDOWN_SECONDS:
+        return False
+    USER_COOLDOWN[user_id] = now
+    CHANNEL_COOLDOWN[channel_id] = now
+    return True
+
+
 # ------------------------------------------------------------------------------
-# 20. Database Helpers (With context cleanup & transactions)
+# Database Helpers (With context cleanup & transactions)
 # ------------------------------------------------------------------------------
 
 
@@ -114,28 +206,35 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     try:
-        # 17. Safe migration within a transaction
-        conn.execute("BEGIN TRANSACTION;")
-        res = conn.execute("PRAGMA table_info(channel_languages)").fetchall()
-        if res:
-            pk_count = sum(1 for col in res if col[5] > 0)
-            if pk_count == 1:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS channel_languages_migrated (channel_id TEXT, target_lang TEXT, PRIMARY KEY (channel_id, target_lang));"
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO channel_languages_migrated SELECT channel_id, target_lang FROM channel_languages;"
-                )
-                conn.execute("DROP TABLE channel_languages;")
-                conn.execute(
-                    "ALTER TABLE channel_languages_migrated RENAME TO channel_languages;"
-                )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"Database migration error: {e}")
+        # Safe migration within a transaction
+        try:
+            conn.execute("BEGIN TRANSACTION;")
+            res = conn.execute("PRAGMA table_info(channel_languages)").fetchall()
+            if res:
+                pk_count = sum(1 for col in res if col[5] > 0)
+                if pk_count == 1:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS channel_languages_migrated "
+                        "(channel_id TEXT, target_lang TEXT, "
+                        "PRIMARY KEY (channel_id, target_lang));"
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO channel_languages_migrated "
+                        "SELECT channel_id, target_lang FROM channel_languages;"
+                    )
+                    conn.execute("DROP TABLE channel_languages;")
+                    conn.execute(
+                        "ALTER TABLE channel_languages_migrated "
+                        "RENAME TO channel_languages;"
+                    )
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            log.error("Database migration error: %s", e)
 
-    try:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS channel_languages (
@@ -153,14 +252,6 @@ def init_db():
             )
         """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_help_seen (
-                user_id TEXT PRIMARY KEY
-            )
-        """
-        )
-        # 18. Add UNIQUE constraint to prevent duplicate channel rules
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS custom_channel_translations (
@@ -323,22 +414,11 @@ def get_user_language_db(user_id: int) -> str | None:
         conn.close()
 
 
-def has_user_seen_help(user_id: int) -> bool:
-    conn = get_db_connection()
-    try:
-        res = conn.execute(
-            "SELECT 1 FROM user_help_seen WHERE user_id = ?", (str(user_id),)
-        )
-        return res.fetchone() is not None
-    finally:
-        conn.close()
-
-
-def mark_user_seen_help(user_id: int):
+def clear_user_language_db(user_id: int):
     conn = get_db_connection()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO user_help_seen (user_id) VALUES (?)",
+            "DELETE FROM user_languages WHERE user_id = ?",
             (str(user_id),),
         )
         conn.commit()
@@ -364,13 +444,49 @@ def add_custom_channel_translation_db(
     invalidate_channel_cache(channel_id)
 
 
+def remove_custom_channel_translation_db(
+    channel_id: int, src_lang: str, target_lang: str
+):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            DELETE FROM custom_channel_translations
+            WHERE channel_id = ? AND src_lang = ? AND target_lang = ?
+        """,
+            (str(channel_id), src_lang, target_lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
+
+
+def clear_channel_rules_db(channel_id: int):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "DELETE FROM custom_channel_translations WHERE channel_id = ?",
+            (str(channel_id),),
+        )
+        conn.execute(
+            "DELETE FROM channel_languages WHERE channel_id = ?",
+            (str(channel_id),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
+
+
 def get_custom_channel_translations_db(
     channel_id: int,
 ) -> list[tuple[int, str, str]]:
     conn = get_db_connection()
     try:
         res = conn.execute(
-            "SELECT id, src_lang, target_lang FROM custom_channel_translations WHERE channel_id = ? ORDER BY id ASC",
+            "SELECT id, src_lang, target_lang FROM custom_channel_translations "
+            "WHERE channel_id = ? ORDER BY id ASC",
             (str(channel_id),),
         )
         return res.fetchall()
@@ -380,13 +496,26 @@ def get_custom_channel_translations_db(
 
 def get_cached_channel_settings(channel_id: int | str) -> dict:
     cid = str(channel_id)
-    if cid not in CHANNEL_CACHE:
-        CHANNEL_CACHE[cid] = {
-            "defaults": get_channel_languages_db(int(cid)),
-            "rules": get_custom_channel_translations_db(int(cid)),
-            "is_global": is_global_chat_channel_db(int(cid)),
-        }
-    return CHANNEL_CACHE[cid]
+    if cid in CHANNEL_CACHE:
+        CHANNEL_CACHE.move_to_end(cid)
+        return CHANNEL_CACHE[cid]
+
+    settings = {
+        "defaults": get_channel_languages_db(int(cid)),
+        "rules": get_custom_channel_translations_db(int(cid)),
+        "is_global": is_global_chat_channel_db(int(cid)),
+    }
+    CHANNEL_CACHE[cid] = settings
+    if len(CHANNEL_CACHE) > CHANNEL_CACHE_MAX:
+        CHANNEL_CACHE.popitem(last=False)
+    return settings
+
+
+def resolve_channel_id(channel: discord.abc.Messageable) -> int:
+    """Return parent channel ID for threads, otherwise the channel's own ID."""
+    if isinstance(channel, discord.Thread) and channel.parent_id:
+        return channel.parent_id
+    return channel.id  # type: ignore[attr-defined]
 
 
 # ------------------------------------------------------------------------------
@@ -412,19 +541,43 @@ def is_worth_translating(text: str) -> bool:
 
 
 def get_clean_lang_name(code: str) -> str:
+    code_upper = code.upper()
     for name, lang_code in LANGUAGES.items():
-        if lang_code.lower() == code.lower():
+        if lang_code.upper() == code_upper:
             return name.split(" (")[0]
-    return code.upper()
+    fallbacks = {
+        "EN": "English",
+        "ZH": "Chinese",
+        "PT": "Portuguese",
+    }
+    return fallbacks.get(code_upper, code_upper)
 
 
 def is_lang_match(lang1: str, lang2: str) -> bool:
-    l1, l2 = lang1.lower(), lang2.lower()
+    """
+    Loose match that treats EN / EN-US / EN-GB as the same family.
+    Explicitly does NOT treat ZH and ZH-HANT as the same so that
+    Simplified ↔ Traditional translation still occurs.
+    """
+    l1, l2 = lang1.upper(), lang2.upper()
     if l1 == l2:
         return True
-    if l1.split("-")[0] == l2.split("-")[0] and (len(l1) == 2 or len(l2) == 2):
+
+    # Special case: keep ZH and ZH-HANT distinct
+    zh_family = {"ZH", "ZH-HANS", "ZH-HANT"}
+    if l1 in zh_family and l2 in zh_family:
+        return False
+
+    base1 = l1.split("-")[0]
+    base2 = l2.split("-")[0]
+    if base1 == base2:
         return True
     return False
+
+
+def normalize_deepl_code(code: str) -> str:
+    """Normalise stored / user-facing codes to the form DeepL expects."""
+    return code.upper().replace("_", "-")
 
 
 async def get_effective_user_language_async(
@@ -432,7 +585,7 @@ async def get_effective_user_language_async(
 ) -> str:
     db_lang = await asyncio.to_thread(get_user_language_db, user.id)
     if db_lang:
-        return db_lang
+        return normalize_deepl_code(db_lang)
 
     if isinstance(user, discord.Member):
         for role in user.roles:
@@ -440,30 +593,34 @@ async def get_effective_user_language_async(
             if role_name_lower in ROLE_LANGUAGES:
                 return ROLE_LANGUAGES[role_name_lower]
 
-    return "en"
+    return "EN-US"
 
 
 def generate_progress_bar(used: int, total: int, length: int = 16) -> str:
-    pct = min(used / total, 1.0)
+    pct = min(used / total, 1.0) if total > 0 else 0.0
     filled = int(length * pct)
     bar = "█" * filled + "░" * (length - filled)
     return f"[{bar}] {pct * 100:.1f}%"
 
 
-def protect_emotes_html(text: str) -> str:
-    return EMOTE_REGEX.sub(r'<span class="notranslate">\1</span>', text)
+def protect_text_for_deepl(text: str) -> str:
+    """
+    Escape HTML first, then wrap custom emotes in notranslate spans so
+    DeepL's tag_handling=html leaves them intact.
+    """
+    escaped = html.escape(text, quote=False)
+    return EMOTE_REGEX.sub(r'<span class="notranslate">\1</span>', escaped)
 
 
-def restore_emotes_html(text: str) -> str:
-    return (
-        text.replace('<span class="notranslate">', "")
-        .replace("</span>", "")
-        .replace('<span class="notranslate" >', "")
-    )
+def restore_text_from_deepl(text: str) -> str:
+    # Remove the protective spans we added
+    text = re.sub(r'</?span[^>]*>', '', text)
+    # Unescape any entities DeepL may have left
+    return html.unescape(text)
 
 
 # ------------------------------------------------------------------------------
-# 4. Session Validation & 6. Azure Client with Timeouts and Error Handling
+# DeepL Client Helpers (timeouts + error handling)
 # ------------------------------------------------------------------------------
 
 
@@ -473,99 +630,122 @@ def require_session(bot_instance) -> aiohttp.ClientSession:
     return bot_instance.session
 
 
-async def detect_text_language(
-    session: aiohttp.ClientSession, text: str
-) -> tuple[str, int]:
-    protected_text = protect_emotes_html(text)
-    url = "https://api.cognitive.microsofttranslator.com/detect?api-version=3.0"
-    headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_TRANSLATE_KEY.strip(),
-        "Ocp-Apim-Subscription-Region": AZURE_TRANSLATE_REGION.strip(),
-        "Content-type": "application/json",
+def _deepl_headers() -> dict:
+    return {
+        "Authorization": f"DeepL-Auth-Key {DEEPL_AUTH_KEY.strip()}",
+        "Content-Type": "application/json",
     }
-    body = [{"text": protected_text}]
 
+
+async def _deepl_translate_one(
+    session: aiohttp.ClientSession,
+    protected_text: str,
+    target_lang: str,
+) -> Optional[tuple[str, str, int]]:
+    """
+    Single-target DeepL call.
+    Returns (translated_text, detected_source, billed_characters) or None.
+    """
+    url = f"{DEEPL_BASE_URL}/v2/translate"
+    body = {
+        "text": [protected_text],
+        "target_lang": target_lang,
+        "tag_handling": "html",
+    }
+    sem = DEEPL_SEMAPHORE or asyncio.Semaphore(3)
     try:
-        async with session.post(url, headers=headers, json=body) as resp:
-            # 7. Status checks
-            if resp.status == 200:
-                data = await resp.json()
-                detected_info = data[0]
-                detected_code = detected_info.get("language", "Unknown")
-                score = detected_info.get("score", 1.0)
-                return detected_code, int(score * 100)
-            elif resp.status == 429:
-                print("Azure API error: Rate limit exceeded (429)")
-            elif resp.status in {401, 403}:
-                print("Azure API error: Auth/region key failure")
-            else:
-                print(f"Azure API error status {resp.status}: {await resp.text()}")
+        async with sem:
+            async with session.post(
+                url, headers=_deepl_headers(), json=body
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    translation = data.get("translations", [{}])[0]
+                    translated = restore_text_from_deepl(
+                        translation.get("text", "")
+                    )
+                    detected = translation.get(
+                        "detected_source_language", "Unknown"
+                    )
+                    billed = translation.get(
+                        "billed_characters", len(protected_text)
+                    )
+                    return translated, detected, billed
+                elif resp.status == 456:
+                    log.warning("DeepL quota exceeded (456)")
+                elif resp.status == 429:
+                    log.warning("DeepL rate limit (429) – backing off")
+                    await asyncio.sleep(1.5)
+                elif resp.status in {401, 403}:
+                    log.error("DeepL authentication failed (%s)", resp.status)
+                else:
+                    body_text = await resp.text()
+                    log.error(
+                        "DeepL error %s for %s: %s",
+                        resp.status,
+                        target_lang,
+                        body_text[:300],
+                    )
     except asyncio.TimeoutError:
-        print("Azure API request timed out.")
+        log.warning("DeepL request timed out for target %s", target_lang)
     except Exception as e:
-        print(f"Language detection error: {e}")
-    return "Unknown", 0
+        log.exception("DeepL translation error for %s: %s", target_lang, e)
+    return None
 
 
 async def translate_text(
-    session: aiohttp.ClientSession, text: str, target_langs: list[str]
+    session: aiohttp.ClientSession,
+    text: str,
+    target_langs: list[str],
 ) -> list[tuple[str, str, str, int]]:
+    """
+    Translate `text` into each language in `target_langs` in parallel
+    (bounded by DEEPL_SEMAPHORE).
+    Returns list of (translated_text, target_code, detected_source, confidence).
+    Confidence is always 100 (DeepL does not expose a score).
+    """
     if not target_langs:
         return []
 
-    # 8. Quota Check Before Making API Calls
+    target_langs = [normalize_deepl_code(t) for t in target_langs]
+
+    # Soft local quota check
     requested_chars = len(text) * len(target_langs)
     current_usage = await asyncio.to_thread(get_monthly_character_usage)
-    if current_usage + requested_chars > AZURE_MONTHLY_LIMIT:
-        print("Translation skipped: Monthly Azure quota exceeded.")
+    if current_usage + requested_chars > DEEPL_MONTHLY_LIMIT:
+        log.warning(
+            "Translation skipped: local monthly quota would be exceeded "
+            "(%s + %s > %s)",
+            current_usage,
+            requested_chars,
+            DEEPL_MONTHLY_LIMIT,
+        )
         return []
 
-    protected_text = protect_emotes_html(text)
-    to_params = "&".join([f"to={lang}" for lang in target_langs])
-    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&{to_params}&textType=html"
+    protected_text = protect_text_for_deepl(text)
 
-    headers = {
-        "Ocp-Apim-Subscription-Key": AZURE_TRANSLATE_KEY.strip(),
-        "Ocp-Apim-Subscription-Region": AZURE_TRANSLATE_REGION.strip(),
-        "Content-type": "application/json",
-    }
-    body = [{"text": protected_text}]
+    async def _one(target: str):
+        result = await _deepl_translate_one(session, protected_text, target)
+        if result is None:
+            return None
+        translated, detected, billed = result
+        await asyncio.to_thread(log_character_usage, billed)
+        return translated, target, detected, 100
 
-    try:
-        async with session.post(url, headers=headers, json=body) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                detected_info = data[0].get("detectedLanguage", {})
-                detected_code = detected_info.get("language", "Unknown")
-                score = detected_info.get("score", 1.0)
-                confidence = int(score * 100)
+    gathered = await asyncio.gather(
+        *[_one(t) for t in target_langs], return_exceptions=True
+    )
 
-                await asyncio.to_thread(
-                    log_character_usage, len(protected_text) * len(target_langs)
-                )
-
-                results = []
-                for item in data[0].get("translations", []):
-                    translated = restore_emotes_html(item.get("text", ""))
-                    target_code = item.get("to", "")
-                    results.append(
-                        (translated, target_code, detected_code, confidence)
-                    )
-                return results
-            elif resp.status == 429:
-                print("Azure API error: Rate limit exceeded (429)")
-            elif resp.status in {401, 403}:
-                print("Azure API error: Authentication failed")
-            else:
-                print(f"Azure API error ({resp.status}): {await resp.text()}")
-    except asyncio.TimeoutError:
-        print("Azure API request timed out.")
-    except Exception as e:
-        print(f"Translation error: {e}")
-    return []
+    results: list[tuple[str, str, str, int]] = []
+    for item in gathered:
+        if isinstance(item, Exception):
+            log.error("Parallel translate task failed: %s", item)
+            continue
+        if item is not None:
+            results.append(item)
+    return results
 
 
-# 5. Return None on Translation Failure instead of fake embed
 async def translate_single(
     session: aiohttp.ClientSession, text: str, target_lang: str
 ) -> tuple[str, str, int] | None:
@@ -581,7 +761,7 @@ def build_translation_embed(
     translated_text: str,
     src_code: str,
     target_code: str,
-    confidence: int,
+    confidence: int = 100,
 ) -> discord.Embed:
     target_name = get_clean_lang_name(target_code)
     src_name = get_clean_lang_name(src_code)
@@ -595,18 +775,21 @@ def build_translation_embed(
     )
     embed.set_thumbnail(url=author.display_avatar.url)
     embed.set_footer(
-        text=f"Original: {src_name} ({src_code.lower()}) • Confidence: {confidence}% • Provider: Azure AI"
+        text=f"Original: {src_name} ({src_code.upper()}) • Provider: DeepL"
     )
-
     return embed
 
 
 # ------------------------------------------------------------------------------
-# 15. Persistent UI Views across Restarts
+# Persistent UI Views
 # ------------------------------------------------------------------------------
 
 
 class GlobalTranslateView(discord.ui.View):
+    """
+    Persistent view attached to the bot's "Translate Here" reply.
+    The original message is recovered via message.reference.
+    """
 
     def __init__(self):
         super().__init__(timeout=None)
@@ -615,37 +798,69 @@ class GlobalTranslateView(discord.ui.View):
         label="Translate / 翻譯",
         style=discord.ButtonStyle.secondary,
         emoji="🌐",
-        custom_id="global_translate_button_v1",  # Explicit custom_id for persistence
+        custom_id="global_translate_button_v1",
     )
     async def translate_callback(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if not interaction.message or not interaction.message.content:
+        if not interaction.message:
             await interaction.response.send_message(
-                "Unable to retrieve message content.", ephemeral=True
+                "Unable to retrieve message.", ephemeral=True
             )
             return
 
-        cleaned_text = strip_untranslatable_content(interaction.message.content)
+        # Resolve the original user message via the reply reference
+        target_msg = interaction.message
+        if (
+            interaction.message.reference
+            and interaction.message.reference.message_id
+        ):
+            try:
+                target_msg = await interaction.channel.fetch_message(
+                    interaction.message.reference.message_id
+                )
+            except discord.NotFound:
+                await interaction.response.send_message(
+                    "Original message was deleted.", ephemeral=True
+                )
+                return
+            except Exception as e:
+                log.warning("Failed to fetch referenced message: %s", e)
+                await interaction.response.send_message(
+                    "Could not retrieve the original message.", ephemeral=True
+                )
+                return
+
+        cleaned_text = strip_untranslatable_content(target_msg.content or "")
         if not cleaned_text:
             await interaction.response.send_message(
-                "Cannot translate empty text or non-text elements.", ephemeral=True
+                "Cannot translate empty text or non-text elements.",
+                ephemeral=True,
             )
             return
 
-        user_lang = await asyncio.to_thread(
+        # Consistent language resolution (DB → role → EN-US)
+        user_lang = await get_effective_user_language_async(interaction.user)
+
+        # If the user has never set a preference and has no matching role,
+        # still show the picker (get_effective returns EN-US by default,
+        # so we only prompt when the DB entry is missing AND no role matched).
+        db_lang = await asyncio.to_thread(
             get_user_language_db, interaction.user.id
         )
-
-        if not user_lang:
+        if db_lang is None and not any(
+            role.name.strip().lower() in ROLE_LANGUAGES
+            for role in getattr(interaction.user, "roles", [])
+        ):
             guide_embed = discord.Embed(
                 title="🌐 Set Target Language / 設定語言",
-                description="Please choose your target language below to complete translation:",
+                description=(
+                    "Please choose your target language below "
+                    "to complete translation:"
+                ),
                 color=discord.Color.gold(),
             )
-            prompt_view = LanguagePromptView(
-                cleaned_text, interaction.message.author
-            )
+            prompt_view = LanguagePromptView(cleaned_text, target_msg.author)
             await interaction.response.send_message(
                 embed=guide_embed, view=prompt_view, ephemeral=True
             )
@@ -655,7 +870,6 @@ class GlobalTranslateView(discord.ui.View):
             require_session(interaction.client), cleaned_text, user_lang
         )
 
-        # 5. Handle failed translations explicitly
         if result is None:
             await interaction.response.send_message(
                 "⚠️ Translation failed or limit reached. Please try again later.",
@@ -665,17 +879,21 @@ class GlobalTranslateView(discord.ui.View):
 
         translated, src_lang, confidence = result
         embed = build_translation_embed(
-            author=interaction.message.author,
+            author=target_msg.author,
             translated_text=translated,
             src_code=src_lang,
             target_code=user_lang,
             confidence=confidence,
         )
-
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class LanguagePromptSelect(discord.ui.Select):
+    """
+    Discord Select menus are capped at 25 options.
+    LANGUAGES is ordered so the 25 most common languages appear here;
+    the remaining five (FI, EL, HU, RO, BG) are still available via /setlanguage.
+    """
 
     def __init__(
         self, original_text: str, author: discord.User | discord.Member
@@ -720,9 +938,11 @@ class LanguagePromptSelect(discord.ui.Select):
             target_code=selected_lang,
             confidence=confidence,
         )
-
         await interaction.response.send_message(
-            content=f"✅ Preferred language set to **{lang_name}** (`{selected_lang}`):",
+            content=(
+                f"✅ Preferred language set to **{lang_name}** "
+                f"(`{selected_lang}`):"
+            ),
             embed=embed,
             ephemeral=True,
         )
@@ -737,40 +957,6 @@ class LanguagePromptView(discord.ui.View):
         self.add_item(LanguagePromptSelect(original_text, author))
 
 
-class WelcomeLanguageSelect(discord.ui.Select):
-
-    def __init__(self):
-        options = [
-            discord.SelectOption(label=name, value=code)
-            for name, code in list(LANGUAGES.items())[:25]
-        ]
-        super().__init__(
-            placeholder="🌐 Choose your language...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_lang = self.values[0]
-        await asyncio.to_thread(
-            set_user_language_db, interaction.user.id, selected_lang
-        )
-        lang_name = get_clean_lang_name(selected_lang)
-
-        await interaction.response.send_message(
-            f"✅ Preferred translation language set to **{lang_name}** (`{selected_lang}`)!",
-            ephemeral=True,
-        )
-
-
-class WelcomeLanguageView(discord.ui.View):
-
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(WelcomeLanguageSelect())
-
-
 # ------------------------------------------------------------------------------
 # Bot Setup & Unified Error Handlers
 # ------------------------------------------------------------------------------
@@ -783,14 +969,11 @@ class TranslationBot(commands.Bot):
         self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
-        # 6. Session Timeout Enforcement
+        global DEEPL_SEMAPHORE
         timeout = aiohttp.ClientTimeout(total=20)
         self.session = aiohttp.ClientSession(timeout=timeout)
-
-        # 9. Non-blocking initialization
+        DEEPL_SEMAPHORE = asyncio.Semaphore(3)
         await asyncio.to_thread(init_db)
-
-        # 15. Register Persistent Global View
         self.add_view(GlobalTranslateView())
 
     async def close(self):
@@ -807,23 +990,40 @@ intents.members = True
 bot = TranslationBot(command_prefix="!", intents=intents)
 
 
-# 1. Global Tree Error Handler
 @bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError
 ):
     if isinstance(error, app_commands.MissingPermissions):
-        msg = "⛔ You need the **Manage Channels** permission to execute this command."
+        msg = (
+            "⛔ You need the **Manage Channels** permission "
+            "to execute this command."
+        )
     elif isinstance(error, app_commands.CheckFailure):
         msg = "⛔ You do not have permission to execute this command."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"⏳ Slow down! Try again in {error.retry_after:.1f}s."
     else:
-        print(f"App command error: {error}")
+        log.exception("App command error: %s", error)
         msg = "⚠️ An unexpected error occurred while processing your request."
 
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
     else:
         await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.NotOwner):
+        await ctx.send("⛔ Only the bot owner can run this command.", delete_after=8)
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            "⛔ You lack the required permissions for this command.",
+            delete_after=8,
+        )
+    else:
+        log.exception("Prefix command error: %s", error)
 
 
 async def language_autocomplete(
@@ -838,10 +1038,10 @@ async def language_autocomplete(
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+    log.info("DeepL endpoint: %s", DEEPL_BASE_URL)
 
 
-# 14. Guild Check for !sync
 @bot.command()
 @commands.is_owner()
 async def sync(ctx: commands.Context):
@@ -854,18 +1054,32 @@ async def sync(ctx: commands.Context):
 
 
 # ------------------------------------------------------------------------------
-# Commands
+# Slash Commands
 # ------------------------------------------------------------------------------
 
 
 @bot.tree.command(
     name="setglobalchat",
-    description="Toggle global language chat mode for a channel",
+    description="Toggle or query global language chat mode for a channel",
+)
+@app_commands.describe(
+    channel="Target text channel (defaults to current)",
+    action="enable / disable / status (default: toggle)",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="toggle", value="toggle"),
+        app_commands.Choice(name="enable", value="enable"),
+        app_commands.Choice(name="disable", value="disable"),
+        app_commands.Choice(name="status", value="status"),
+    ]
 )
 @app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.checks.cooldown(1, 3.0)
 async def set_global_chat(
     interaction: discord.Interaction,
     channel: discord.TextChannel | None = None,
+    action: app_commands.Choice[str] | None = None,
 ):
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, discord.TextChannel):
@@ -877,29 +1091,59 @@ async def set_global_chat(
     settings = await asyncio.to_thread(
         get_cached_channel_settings, target_channel.id
     )
-    new_status = not settings.get("is_global", False)
+    current = settings.get("is_global", False)
+    act = (action.value if action else "toggle").lower()
+
+    if act == "status":
+        status_str = "enabled" if current else "disabled"
+        await interaction.response.send_message(
+            f"🌐 Global Language Chat is currently **{status_str}** "
+            f"for {target_channel.mention}.",
+            ephemeral=True,
+        )
+        return
+
+    if act == "enable":
+        new_status = True
+    elif act == "disable":
+        new_status = False
+    else:
+        new_status = not current
 
     await asyncio.to_thread(
         set_global_chat_channel_db, target_channel.id, new_status
     )
-
     status_str = "enabled" if new_status else "disabled"
     await interaction.response.send_message(
-        f"🌐 Global Language Chat mode has been **{status_str}** for {target_channel.mention}.",
+        f"🌐 Global Language Chat mode has been **{status_str}** "
+        f"for {target_channel.mention}.",
         ephemeral=True,
     )
 
 
 @bot.tree.command(
     name="setlanguage",
-    description="Set your personal target language for translations",
+    description="Set or clear your personal target language for translations",
+)
+@app_commands.describe(
+    language="Target language (leave empty to clear preference)",
 )
 @app_commands.autocomplete(language=language_autocomplete)
+@app_commands.checks.cooldown(1, 3.0)
 async def set_user_language(
     interaction: discord.Interaction,
-    language: str,
+    language: str | None = None,
 ):
-    # 2. Strict Input Validation
+    if language is None:
+        await asyncio.to_thread(clear_user_language_db, interaction.user.id)
+        await interaction.response.send_message(
+            "Your preferred translation language has been cleared. "
+            "Role-based or default (EN-US) will be used.",
+            ephemeral=True,
+        )
+        return
+
+    language = normalize_deepl_code(language)
     if language not in VALID_LANGUAGE_CODES:
         await interaction.response.send_message(
             "Invalid language selection. Please select an option from the list.",
@@ -917,26 +1161,35 @@ async def set_user_language(
 
 @bot.tree.command(
     name="translatechannel",
-    description="Set a rule to translate a specific language in a channel",
+    description="Add a rule to auto-translate a source language in a channel",
+)
+@app_commands.describe(
+    channel="Channel to configure",
+    detectlanguage="Source language to detect",
+    translatedlanguage="Language to translate into",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
 @app_commands.autocomplete(
     detectlanguage=language_autocomplete,
     translatedlanguage=language_autocomplete,
 )
+@app_commands.checks.cooldown(1, 3.0)
 async def translate_channel(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     detectlanguage: str,
     translatedlanguage: str,
 ):
-    # 2. Strict Input Validation for both parameters
+    detectlanguage = normalize_deepl_code(detectlanguage)
+    translatedlanguage = normalize_deepl_code(translatedlanguage)
+
     if (
         detectlanguage not in VALID_LANGUAGE_CODES
         or translatedlanguage not in VALID_LANGUAGE_CODES
     ):
         await interaction.response.send_message(
-            "Invalid language selection. Please choose valid options from the list.",
+            "Invalid language selection. Please choose valid options "
+            "from the list.",
             ephemeral=True,
         )
         return
@@ -956,36 +1209,202 @@ async def translate_channel(
 
 
 @bot.tree.command(
-    name="stats", description="View real-time Azure character usage and quota"
+    name="removechannelrule",
+    description="Remove a specific auto-translate rule from a channel",
 )
-async def stats_command(interaction: discord.Interaction):
-    used = await asyncio.to_thread(get_monthly_character_usage)
-    remaining = max(0, AZURE_MONTHLY_LIMIT - used)
-    progress_bar = generate_progress_bar(used, AZURE_MONTHLY_LIMIT)
+@app_commands.describe(
+    channel="Channel to configure",
+    detectlanguage="Source language of the rule",
+    translatedlanguage="Target language of the rule",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.autocomplete(
+    detectlanguage=language_autocomplete,
+    translatedlanguage=language_autocomplete,
+)
+@app_commands.checks.cooldown(1, 3.0)
+async def remove_channel_rule(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    detectlanguage: str,
+    translatedlanguage: str,
+):
+    detectlanguage = normalize_deepl_code(detectlanguage)
+    translatedlanguage = normalize_deepl_code(translatedlanguage)
+
+    await asyncio.to_thread(
+        remove_custom_channel_translation_db,
+        channel.id,
+        detectlanguage,
+        translatedlanguage,
+    )
+    src_name = get_clean_lang_name(detectlanguage)
+    target_name = get_clean_lang_name(translatedlanguage)
+    await interaction.response.send_message(
+        f"Removed rule for {channel.mention}: **{src_name}** ➔ **{target_name}** "
+        f"(if it existed).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="clearchannelrules",
+    description="Clear all auto-translate rules and defaults for a channel",
+)
+@app_commands.describe(channel="Channel to clear")
+@app_commands.checks.has_permissions(manage_channels=True)
+@app_commands.checks.cooldown(1, 5.0)
+async def clear_channel_rules(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await asyncio.to_thread(clear_channel_rules_db, channel.id)
+    await interaction.response.send_message(
+        f"All translation rules and defaults cleared for {channel.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="listchannelrules",
+    description="List current auto-translate rules for a channel",
+)
+@app_commands.describe(channel="Channel to inspect (defaults to current)")
+@app_commands.checks.cooldown(1, 3.0)
+async def list_channel_rules(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+):
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message(
+            "Please specify a valid text channel.", ephemeral=True
+        )
+        return
+
+    settings = await asyncio.to_thread(
+        get_cached_channel_settings, target.id
+    )
+    rules = settings.get("rules", [])
+    defaults = settings.get("defaults", [])
+    is_global = settings.get("is_global", False)
+
+    lines = [
+        f"**Channel:** {target.mention}",
+        f"**Global chat mode:** {'enabled' if is_global else 'disabled'}",
+        "",
+        "**Custom rules:**",
+    ]
+    if rules:
+        for _, src, tgt in rules:
+            lines.append(
+                f"• {get_clean_lang_name(src)} (`{src}`) ➔ "
+                f"{get_clean_lang_name(tgt)} (`{tgt}`)"
+            )
+    else:
+        lines.append("• (none)")
+
+    lines.append("")
+    lines.append("**Default target languages:**")
+    if defaults:
+        for d in defaults:
+            lines.append(f"• {get_clean_lang_name(d)} (`{d}`)")
+    else:
+        lines.append("• (none)")
 
     embed = discord.Embed(
-        title="📊 Azure Translation Usage Tracker", color=discord.Color.purple()
+        title="Channel Translation Settings",
+        description="\n".join(lines),
+        color=discord.Color.purple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="stats",
+    description="View DeepL character usage and quota (local tracker)",
+)
+@app_commands.checks.cooldown(1, 5.0)
+async def stats_command(interaction: discord.Interaction):
+    used = await asyncio.to_thread(get_monthly_character_usage)
+    remaining = max(0, DEEPL_MONTHLY_LIMIT - used)
+    progress_bar = generate_progress_bar(used, DEEPL_MONTHLY_LIMIT)
+
+    plan = "Free" if (DEEPL_AUTH_KEY or "").endswith(":fx") else "Pro"
+    embed = discord.Embed(
+        title="📊 DeepL Translation Usage Tracker",
+        color=discord.Color.purple(),
     )
     embed.add_field(
-        name="Monthly Character Usage",
+        name="Monthly Character Usage (local tracker)",
         value=f"`{progress_bar}`",
         inline=False,
     )
-    embed.add_field(
-        name="Used Characters", value=f"**{used:,}**", inline=True
-    )
+    embed.add_field(name="Used Characters", value=f"**{used:,}**", inline=True)
     embed.add_field(
         name="Remaining Capacity", value=f"**{remaining:,}**", inline=True
     )
+    embed.add_field(
+        name="Plan / Soft Limit",
+        value=f"**{plan}** · {DEEPL_MONTHLY_LIMIT:,} chars",
+        inline=False,
+    )
+    embed.set_footer(
+        text=(
+            "Local tracker may differ slightly from the DeepL dashboard. "
+            "Free plan hard limit is 500 000 / month."
+        )
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+@bot.tree.command(
+    name="help",
+    description="Show how to use the translation bot",
+)
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🌐 Translation Bot Help",
+        color=discord.Color.purple(),
+        description=(
+            "Translate messages with DeepL. "
+            "Set a preferred language, configure channels, or use reactions."
+        ),
+    )
+    embed.add_field(
+        name="Personal",
+        value=(
+            "`/setlanguage` – set or clear your target language\n"
+            "Right-click a message → **Apps → Translate**\n"
+            "React with a flag emoji (🇺🇸 🇰🇷 🇯🇵 …) for a quick translation"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Channel (Manage Channels)",
+        value=(
+            "`/setglobalchat` – toggle 🌐 prompt mode\n"
+            "`/translatechannel` – add auto-translate rule\n"
+            "`/removechannelrule` – remove one rule\n"
+            "`/clearchannelrules` – clear all rules\n"
+            "`/listchannelrules` – inspect current settings"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Other",
+        value="`/stats` – character usage\n`/help` – this message",
+        inline=False,
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.context_menu(name="Translate")
+@app_commands.checks.cooldown(1, 3.0)
 async def translate_context_menu(
     interaction: discord.Interaction, message: discord.Message
 ):
-    cleaned_content = strip_untranslatable_content(message.content)
+    cleaned_content = strip_untranslatable_content(message.content or "")
     if not cleaned_content:
         await interaction.response.send_message(
             "Cannot translate empty text or non-text elements.", ephemeral=True
@@ -1011,7 +1430,6 @@ async def translate_context_menu(
         target_code=target_lang,
         confidence=score,
     )
-
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1022,71 +1440,102 @@ async def translate_context_menu(
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 12/13. Correct bot filter and process command execution
+    # Always process prefix commands first so !sync etc. stay responsive
+    await bot.process_commands(message)
+
     if message.author.bot or not message.guild:
         return
 
-    if not is_worth_translating(message.content):
-        await bot.process_commands(message)
+    if not is_worth_translating(message.content or ""):
         return
 
+    # Threads inherit parent channel settings
+    channel_id = resolve_channel_id(message.channel)
+
     settings = await asyncio.to_thread(
-        get_cached_channel_settings, message.channel.id
+        get_cached_channel_settings, channel_id
     )
     is_global = settings.get("is_global", False)
 
+    # Global mode only adds a reaction — never bill DeepL, never throttle
     if is_global:
         try:
             await message.add_reaction("🌐")
-        except Exception:
-            pass
-    else:
-        defaults = settings.get("defaults", [])
-        rules = settings.get("rules", [])
+        except Exception as e:
+            log.debug(
+                "Could not add 🌐 reaction in %s: %s", message.channel.id, e
+            )
+        return
 
-        if defaults or rules:
-            text_to_translate = strip_untranslatable_content(message.content)
-            if text_to_translate:
-                src_lang, _ = await detect_text_language(
-                    require_session(bot), text_to_translate
-                )
-                target_langs = set()
+    defaults = settings.get("defaults", [])
+    rules = settings.get("rules", [])
+    if not (defaults or rules):
+        return
 
-                for _, rule_src, rule_target in rules:
-                    if is_lang_match(src_lang, rule_src):
-                        target_langs.add(rule_target)
+    # Rate-limit only when we are about to call DeepL
+    if not _check_cooldown(message.author.id, message.channel.id):
+        return
 
-                for def_lang in defaults:
-                    if not is_lang_match(src_lang, def_lang):
-                        target_langs.add(def_lang)
+    text_to_translate = strip_untranslatable_content(message.content)
+    if not text_to_translate:
+        return
 
-                if target_langs:
-                    translations = await translate_text(
-                        require_session(bot),
-                        text_to_translate,
-                        list(target_langs),
-                    )
-                    for (
-                        translated_text,
-                        target_code,
-                        detected_code,
-                        score,
-                    ) in translations:
-                        embed = build_translation_embed(
-                            author=message.author,
-                            translated_text=translated_text,
-                            src_code=detected_code,
-                            target_code=target_code,
-                            confidence=score,
-                        )
-                        await message.reply(embed=embed, mention_author=False)
+    # Collect every target that *might* apply (rules + defaults).
+    # One parallel batch; each response includes detected_source_language,
+    # so we filter after the fact and never do a separate probe call.
+    candidate_targets: list[str] = []
+    for _, _rule_src, rule_target in rules:
+        candidate_targets.append(rule_target)
+    for def_lang in defaults:
+        candidate_targets.append(def_lang)
 
-    await bot.process_commands(message)
+    seen: set[str] = set()
+    ordered_targets: list[str] = []
+    for t in candidate_targets:
+        nt = normalize_deepl_code(t)
+        if nt not in seen:
+            seen.add(nt)
+            ordered_targets.append(nt)
+
+    if not ordered_targets:
+        return
+
+    translations = await translate_text(
+        require_session(bot), text_to_translate, ordered_targets
+    )
+    if not translations:
+        return
+
+    # All successful results share the same detected source (same input text)
+    detected_src = translations[0][2]
+
+    # Which targets should actually be posted?
+    allowed: set[str] = set()
+    for _, rule_src, rule_target in rules:
+        if is_lang_match(detected_src, rule_src):
+            allowed.add(normalize_deepl_code(rule_target))
+    for def_lang in defaults:
+        if not is_lang_match(detected_src, def_lang):
+            allowed.add(normalize_deepl_code(def_lang))
+
+    for translated_text, target_code, detected_code, score in translations:
+        if target_code not in allowed:
+            continue  # candidate that didn't match after detection
+        embed = build_translation_embed(
+            author=message.author,
+            translated_text=translated_text,
+            src_code=detected_code,
+            target_code=target_code,
+            confidence=score,
+        )
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except Exception as e:
+            log.warning("Failed to reply with translation: %s", e)
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    # 3. Guard against bot.user being None
     if bot.user and payload.user_id == bot.user.id:
         return
 
@@ -1094,61 +1543,77 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if emoji_str != "🌐" and emoji_str not in FLAG_TRANSLATIONS:
         return
 
+    # Prefer cache
+    user = bot.get_user(payload.user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(payload.user_id)
+        except Exception:
+            return
+    if user.bot:
+        return
+
     channel = bot.get_channel(payload.channel_id)
-    if not channel:
+    if channel is None:
         try:
             channel = await bot.fetch_channel(payload.channel_id)
         except Exception:
             return
 
     try:
-        user = await bot.fetch_user(payload.user_id)
-        if user.bot:
-            return
-
         message = await channel.fetch_message(payload.message_id)
-        if not message or not message.content:
+    except Exception as e:
+        log.debug("Could not fetch reacted message: %s", e)
+        return
+
+    if not message or not message.content:
+        return
+
+    text_to_translate = strip_untranslatable_content(message.content)
+    if not text_to_translate:
+        return
+
+    # 🌐 prompt is free (no DeepL call) — skip cooldown
+    if emoji_str == "🌐":
+        clean_prompted_messages_cache()
+        clean_cooldown_caches()
+        if payload.message_id in PROMPTED_MESSAGES:
             return
-
-        text_to_translate = strip_untranslatable_content(message.content)
-        if not text_to_translate:
-            return
-
-        # Handle 🌐 Prompt Button
-        if emoji_str == "🌐":
-            clean_prompted_messages_cache()
-            if payload.message_id in PROMPTED_MESSAGES:
-                return
-
-            PROMPTED_MESSAGES[payload.message_id] = datetime.now(
-                timezone.utc
-            ).timestamp()
-            view = GlobalTranslateView()
+        PROMPTED_MESSAGES[payload.message_id] = datetime.now(
+            timezone.utc
+        ).timestamp()
+        view = GlobalTranslateView()
+        try:
             await message.reply(
                 content="🌐 **Translate Here • 點擊翻譯 • 翻訳 • 번역**",
                 view=view,
                 mention_author=False,
             )
+        except Exception as e:
+            log.warning("Failed to send translate prompt: %s", e)
+        return
 
-        # Handle Flag Emojis
-        else:
-            target_lang = FLAG_TRANSLATIONS[emoji_str]
-            result = await translate_single(
-                require_session(bot), text_to_translate, target_lang
-            )
-            if result:
-                translated, src_lang, confidence = result
-                embed = build_translation_embed(
-                    author=message.author,
-                    translated_text=translated,
-                    src_code=src_lang,
-                    target_code=target_lang,
-                    confidence=confidence,
-                )
-                await message.reply(embed=embed, mention_author=False)
+    # Flag emoji → actual translation — apply rate limit
+    if not _check_cooldown(payload.user_id, payload.channel_id):
+        return
 
-    except Exception as e:
-        print(f"Reaction translation error: {e}")
+    target_lang = FLAG_TRANSLATIONS[emoji_str]
+    result = await translate_single(
+        require_session(bot), text_to_translate, target_lang
+    )
+    if result:
+        translated, src_lang, confidence = result
+        embed = build_translation_embed(
+            author=message.author,
+            translated_text=translated,
+            src_code=src_lang,
+            target_code=target_lang,
+            confidence=confidence,
+        )
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except Exception as e:
+            log.warning("Failed to reply with flag translation: %s", e)
 
 
 if __name__ == "__main__":
