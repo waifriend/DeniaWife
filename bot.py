@@ -9,7 +9,9 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import libsql
 
-# Load environment variables from .env file
+# ------------------------------------------------------------------------------
+# 28. Environment Variable Validation
+# ------------------------------------------------------------------------------
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -18,9 +20,21 @@ AZURE_TRANSLATE_REGION = os.getenv("AZURE_TRANSLATE_REGION")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
+required_env = {
+    "DISCORD_TOKEN": DISCORD_TOKEN,
+    "TURSO_DATABASE_URL": TURSO_DATABASE_URL,
+    "TURSO_AUTH_TOKEN": TURSO_AUTH_TOKEN,
+    "AZURE_TRANSLATE_KEY": AZURE_TRANSLATE_KEY,
+    "AZURE_TRANSLATE_REGION": AZURE_TRANSLATE_REGION,
+}
+missing_env = [k for k, v in required_env.items() if not v]
+if missing_env:
+    raise RuntimeError(
+        f"Missing required environment variables: {', '.join(missing_env)}"
+    )
+
 AZURE_MONTHLY_LIMIT = 2_000_000
 
-# Supported language choices
 LANGUAGES = {
     "English": "en",
     "Korean (한국어)": "ko",
@@ -40,7 +54,9 @@ LANGUAGES = {
     "Hindi (हिन्दी)": "hi",
 }
 
-# Role-based default language mapping
+# 2. Strict language validation set
+VALID_LANGUAGE_CODES = set(LANGUAGES.values())
+
 ROLE_LANGUAGES = {
     "korean": "ko",
     "english": "en",
@@ -50,7 +66,6 @@ ROLE_LANGUAGES = {
     "russian": "ru",
 }
 
-# Flag reactions for in-chat public translation
 FLAG_TRANSLATIONS = {
     "🇹🇼": "zh-Hant",
     "🇰🇷": "ko",
@@ -58,14 +73,35 @@ FLAG_TRANSLATIONS = {
     "🇺🇸": "en",
 }
 
-# Regex matching untranslatable Discord noise
 EMOTE_REGEX = re.compile(r"(<a?:[a-zA-Z0-9_]+:\d+>|:[a-zA-Z0-9_]+:)")
 CODE_BLOCK_REGEX = re.compile(r"```[\s\S]*?```|`[^`]+`")
 URL_REGEX = re.compile(r"https?://\S+|www\.\S+")
 MENTION_REGEX = re.compile(r"<@!?&?\d+>|<#\d+>")
 
+# Cache structure: {channel_id_str: {"defaults": [...], "rules": [...], "is_global": bool}}
+CHANNEL_CACHE: dict[str, dict] = {}
+
+# 10. Bounded cache for prompted messages (cleans old entries to avoid unbounded memory growth)
+PROMPTED_MESSAGES: dict[int, float] = {}
+
+
+def clean_prompted_messages_cache(max_age_seconds: int = 3600):
+    now = datetime.now(timezone.utc).timestamp()
+    expired = [
+        msg_id
+        for msg_id, ts in PROMPTED_MESSAGES.items()
+        if now - ts > max_age_seconds
+    ]
+    for msg_id in expired:
+        PROMPTED_MESSAGES.pop(msg_id, None)
+
+
+def invalidate_channel_cache(channel_id: int | str):
+    CHANNEL_CACHE.pop(str(channel_id), None)
+
+
 # ------------------------------------------------------------------------------
-# Database Helpers (Turso / libSQL)
+# 20. Database Helpers (With context cleanup & transactions)
 # ------------------------------------------------------------------------------
 
 
@@ -77,108 +113,152 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
-
-    # Automatic schema migration for existing channel_languages table
     try:
+        # 17. Safe migration within a transaction
+        conn.execute("BEGIN TRANSACTION;")
         res = conn.execute("PRAGMA table_info(channel_languages)").fetchall()
         if res:
             pk_count = sum(1 for col in res if col[5] > 0)
             if pk_count == 1:
-                # Old single primary key detected; migrate to composite primary key (channel_id, target_lang)
                 conn.execute(
-                    "CREATE TABLE IF NOT EXISTS channel_languages_migrated (channel_id TEXT, target_lang TEXT, PRIMARY KEY (channel_id, target_lang))"
+                    "CREATE TABLE IF NOT EXISTS channel_languages_migrated (channel_id TEXT, target_lang TEXT, PRIMARY KEY (channel_id, target_lang));"
                 )
                 conn.execute(
-                    "INSERT OR IGNORE INTO channel_languages_migrated SELECT channel_id, target_lang FROM channel_languages"
+                    "INSERT OR IGNORE INTO channel_languages_migrated SELECT channel_id, target_lang FROM channel_languages;"
                 )
-                conn.execute("DROP TABLE channel_languages")
+                conn.execute("DROP TABLE channel_languages;")
                 conn.execute(
-                    "ALTER TABLE channel_languages_migrated RENAME TO channel_languages"
+                    "ALTER TABLE channel_languages_migrated RENAME TO channel_languages;"
                 )
-                print("Successfully migrated channel_languages table schema.")
+        conn.commit()
     except Exception as e:
-        print(f"Database migration check: {e}")
+        conn.rollback()
+        print(f"Database migration error: {e}")
 
-    conn.execute(
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_languages (
+                channel_id TEXT,
+                target_lang TEXT,
+                PRIMARY KEY (channel_id, target_lang)
+            )
         """
-        CREATE TABLE IF NOT EXISTS channel_languages (
-            channel_id TEXT,
-            target_lang TEXT,
-            PRIMARY KEY (channel_id, target_lang)
         )
-    """
-    )
-    conn.execute(
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_languages (
+                user_id TEXT PRIMARY KEY,
+                target_lang TEXT NOT NULL
+            )
         """
-        CREATE TABLE IF NOT EXISTS user_languages (
-            user_id TEXT PRIMARY KEY,
-            target_lang TEXT NOT NULL
         )
-    """
-    )
-    conn.execute(
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_help_seen (
+                user_id TEXT PRIMARY KEY
+            )
         """
-        CREATE TABLE IF NOT EXISTS user_help_seen (
-            user_id TEXT PRIMARY KEY
         )
-    """
-    )
-    conn.execute(
+        # 18. Add UNIQUE constraint to prevent duplicate channel rules
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS custom_channel_translations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                src_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                UNIQUE(channel_id, src_lang, target_lang)
+            )
         """
-        CREATE TABLE IF NOT EXISTS custom_channel_translations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id TEXT NOT NULL,
-            src_lang TEXT NOT NULL,
-            target_lang TEXT NOT NULL
         )
-    """
-    )
-    conn.execute(
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS global_chat_channels (
+                channel_id TEXT PRIMARY KEY
+            )
         """
-        CREATE TABLE IF NOT EXISTS character_usage (
-            month_year TEXT PRIMARY KEY,
-            char_count INTEGER DEFAULT 0
         )
-    """
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS character_usage (
+                month_year TEXT PRIMARY KEY,
+                char_count INTEGER DEFAULT 0
+            )
+        """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_channel_language_db(channel_id: int, target_lang: str):
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO channel_languages (channel_id, target_lang)
-        VALUES (?, ?)
-    """,
-        (str(channel_id), target_lang),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_languages (channel_id, target_lang) VALUES (?, ?)",
+            (str(channel_id), target_lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
 
 
 def remove_channel_language_db(channel_id: int, target_lang: str):
     conn = get_db_connection()
-    conn.execute(
-        """
-        DELETE FROM channel_languages WHERE channel_id = ? AND target_lang = ?
-    """,
-        (str(channel_id), target_lang),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "DELETE FROM channel_languages WHERE channel_id = ? AND target_lang = ?",
+            (str(channel_id), target_lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
 
 
 def get_channel_languages_db(channel_id: int) -> list[str]:
     conn = get_db_connection()
-    res = conn.execute(
-        "SELECT target_lang FROM channel_languages WHERE channel_id = ?",
-        (str(channel_id),),
-    )
-    rows = res.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    try:
+        res = conn.execute(
+            "SELECT target_lang FROM channel_languages WHERE channel_id = ?",
+            (str(channel_id),),
+        )
+        return [r[0] for r in res.fetchall()]
+    finally:
+        conn.close()
+
+
+def set_global_chat_channel_db(channel_id: int, enabled: bool):
+    conn = get_db_connection()
+    try:
+        if enabled:
+            conn.execute(
+                "INSERT OR IGNORE INTO global_chat_channels (channel_id) VALUES (?)",
+                (str(channel_id),),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM global_chat_channels WHERE channel_id = ?",
+                (str(channel_id),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
+
+
+def is_global_chat_channel_db(channel_id: int) -> bool:
+    conn = get_db_connection()
+    try:
+        res = conn.execute(
+            "SELECT 1 FROM global_chat_channels WHERE channel_id = ?",
+            (str(channel_id),),
+        )
+        return res.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def log_character_usage(char_count: int):
@@ -186,122 +266,131 @@ def log_character_usage(char_count: int):
         return
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT INTO character_usage (month_year, char_count)
-        VALUES (?, ?)
-        ON CONFLICT(month_year) DO UPDATE SET char_count = char_count + excluded.char_count
-    """,
-        (current_month, char_count),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO character_usage (month_year, char_count)
+            VALUES (?, ?)
+            ON CONFLICT(month_year) DO UPDATE SET char_count = char_count + excluded.char_count
+        """,
+            (current_month, char_count),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_monthly_character_usage() -> int:
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_db_connection()
-    res = conn.execute(
-        "SELECT char_count FROM character_usage WHERE month_year = ?",
-        (current_month,),
-    )
-    row = res.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    try:
+        res = conn.execute(
+            "SELECT char_count FROM character_usage WHERE month_year = ?",
+            (current_month,),
+        )
+        row = res.fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
 
 
 def set_user_language_db(user_id: int, target_lang: str):
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT INTO user_languages (user_id, target_lang)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET target_lang=excluded.target_lang
-    """,
-        (str(user_id), target_lang),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO user_languages (user_id, target_lang)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET target_lang=excluded.target_lang
+        """,
+            (str(user_id), target_lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_user_language_db(user_id: int) -> str | None:
     conn = get_db_connection()
-    res = conn.execute(
-        "SELECT target_lang FROM user_languages WHERE user_id = ?",
-        (str(user_id),),
-    )
-    row = res.fetchone()
-    conn.close()
-    return row[0] if row else None
+    try:
+        res = conn.execute(
+            "SELECT target_lang FROM user_languages WHERE user_id = ?",
+            (str(user_id),),
+        )
+        row = res.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def has_user_seen_help(user_id: int) -> bool:
     conn = get_db_connection()
-    res = conn.execute(
-        "SELECT 1 FROM user_help_seen WHERE user_id = ?", (str(user_id),)
-    )
-    row = res.fetchone()
-    conn.close()
-    return row is not None
+    try:
+        res = conn.execute(
+            "SELECT 1 FROM user_help_seen WHERE user_id = ?", (str(user_id),)
+        )
+        return res.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def mark_user_seen_help(user_id: int):
     conn = get_db_connection()
-    conn.execute(
-        "INSERT OR IGNORE INTO user_help_seen (user_id) VALUES (?)",
-        (str(user_id),),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_help_seen (user_id) VALUES (?)",
+            (str(user_id),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_custom_channel_translation_db(
     channel_id: int, src_lang: str, target_lang: str
 ):
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT INTO custom_channel_translations (channel_id, src_lang, target_lang)
-        VALUES (?, ?, ?)
-    """,
-        (str(channel_id), src_lang, target_lang),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO custom_channel_translations (channel_id, src_lang, target_lang)
+            VALUES (?, ?, ?)
+        """,
+            (str(channel_id), src_lang, target_lang),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_channel_cache(channel_id)
 
 
 def get_custom_channel_translations_db(
     channel_id: int,
 ) -> list[tuple[int, str, str]]:
     conn = get_db_connection()
-    res = conn.execute(
-        "SELECT id, src_lang, target_lang FROM custom_channel_translations WHERE channel_id = ? ORDER BY id ASC",
-        (str(channel_id),),
-    )
-    rows = res.fetchall()
-    conn.close()
-    return rows
-
-
-def delete_custom_channel_translation_by_index_db(
-    channel_id: int, index: int
-) -> tuple[str, str] | None:
-    rules = get_custom_channel_translations_db(channel_id)
-    if 1 <= index <= len(rules):
-        rule_id, src_lang, target_lang = rules[index - 1]
-        conn = get_db_connection()
-        conn.execute(
-            "DELETE FROM custom_channel_translations WHERE id = ?",
-            (rule_id,),
+    try:
+        res = conn.execute(
+            "SELECT id, src_lang, target_lang FROM custom_channel_translations WHERE channel_id = ? ORDER BY id ASC",
+            (str(channel_id),),
         )
-        conn.commit()
+        return res.fetchall()
+    finally:
         conn.close()
-        return src_lang, target_lang
-    return None
+
+
+def get_cached_channel_settings(channel_id: int | str) -> dict:
+    cid = str(channel_id)
+    if cid not in CHANNEL_CACHE:
+        CHANNEL_CACHE[cid] = {
+            "defaults": get_channel_languages_db(int(cid)),
+            "rules": get_custom_channel_translations_db(int(cid)),
+            "is_global": is_global_chat_channel_db(int(cid)),
+        }
+    return CHANNEL_CACHE[cid]
 
 
 # ------------------------------------------------------------------------------
-# Content Stripper & Helpers
+# Helpers & Formatting
 # ------------------------------------------------------------------------------
 
 
@@ -338,8 +427,10 @@ def is_lang_match(lang1: str, lang2: str) -> bool:
     return False
 
 
-def get_effective_user_language(user: discord.User | discord.Member) -> str:
-    db_lang = get_user_language_db(user.id)
+async def get_effective_user_language_async(
+    user: discord.User | discord.Member,
+) -> str:
+    db_lang = await asyncio.to_thread(get_user_language_db, user.id)
     if db_lang:
         return db_lang
 
@@ -359,11 +450,6 @@ def generate_progress_bar(used: int, total: int, length: int = 16) -> str:
     return f"[{bar}] {pct * 100:.1f}%"
 
 
-# ------------------------------------------------------------------------------
-# Azure API Integration
-# ------------------------------------------------------------------------------
-
-
 def protect_emotes_html(text: str) -> str:
     return EMOTE_REGEX.sub(r'<span class="notranslate">\1</span>', text)
 
@@ -376,10 +462,20 @@ def restore_emotes_html(text: str) -> str:
     )
 
 
-async def detect_text_language(text: str) -> tuple[str, int]:
-    if not AZURE_TRANSLATE_KEY or not AZURE_TRANSLATE_REGION:
-        return "Unknown", 0
+# ------------------------------------------------------------------------------
+# 4. Session Validation & 6. Azure Client with Timeouts and Error Handling
+# ------------------------------------------------------------------------------
 
+
+def require_session(bot_instance) -> aiohttp.ClientSession:
+    if bot_instance.session is None or bot_instance.session.closed:
+        raise RuntimeError("HTTP session is not available")
+    return bot_instance.session
+
+
+async def detect_text_language(
+    session: aiohttp.ClientSession, text: str
+) -> tuple[str, int]:
     protected_text = protect_emotes_html(text)
     url = "https://api.cognitive.microsofttranslator.com/detect?api-version=3.0"
     headers = {
@@ -390,30 +486,44 @@ async def detect_text_language(text: str) -> tuple[str, int]:
     body = [{"text": protected_text}]
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=body) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    detected_info = data[0]
-                    detected_code = detected_info.get("language", "Unknown")
-                    score = detected_info.get("score", 1.0)
-                    return detected_code, int(score * 100)
+        async with session.post(url, headers=headers, json=body) as resp:
+            # 7. Status checks
+            if resp.status == 200:
+                data = await resp.json()
+                detected_info = data[0]
+                detected_code = detected_info.get("language", "Unknown")
+                score = detected_info.get("score", 1.0)
+                return detected_code, int(score * 100)
+            elif resp.status == 429:
+                print("Azure API error: Rate limit exceeded (429)")
+            elif resp.status in {401, 403}:
+                print("Azure API error: Auth/region key failure")
+            else:
+                print(f"Azure API error status {resp.status}: {await resp.text()}")
+    except asyncio.TimeoutError:
+        print("Azure API request timed out.")
     except Exception as e:
         print(f"Language detection error: {e}")
     return "Unknown", 0
 
 
-async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
-    if not AZURE_TRANSLATE_KEY or not AZURE_TRANSLATE_REGION:
-        return (
-            "Translation error: Missing credentials in .env",
-            "Unknown",
-            0,
-        )
+async def translate_text(
+    session: aiohttp.ClientSession, text: str, target_langs: list[str]
+) -> list[tuple[str, str, str, int]]:
+    if not target_langs:
+        return []
+
+    # 8. Quota Check Before Making API Calls
+    requested_chars = len(text) * len(target_langs)
+    current_usage = await asyncio.to_thread(get_monthly_character_usage)
+    if current_usage + requested_chars > AZURE_MONTHLY_LIMIT:
+        print("Translation skipped: Monthly Azure quota exceeded.")
+        return []
 
     protected_text = protect_emotes_html(text)
+    to_params = "&".join([f"to={lang}" for lang in target_langs])
+    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&{to_params}&textType=html"
 
-    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={target_lang}&textType=html"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_TRANSLATE_KEY.strip(),
         "Ocp-Apim-Subscription-Region": AZURE_TRANSLATE_REGION.strip(),
@@ -422,30 +532,48 @@ async def translate_text(text: str, target_lang: str) -> tuple[str, str, int]:
     body = [{"text": protected_text}]
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=body) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    raw_translated = data[0]["translations"][0]["text"]
-                    translated = restore_emotes_html(raw_translated)
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                detected_info = data[0].get("detectedLanguage", {})
+                detected_code = detected_info.get("language", "Unknown")
+                score = detected_info.get("score", 1.0)
+                confidence = int(score * 100)
 
-                    detected_info = data[0].get("detectedLanguage", {})
-                    detected_code = detected_info.get("language", "Unknown")
-                    score = detected_info.get("score", 1.0)
-                    confidence = int(score * 100)
+                await asyncio.to_thread(
+                    log_character_usage, len(protected_text) * len(target_langs)
+                )
 
-                    log_character_usage(len(protected_text))
-
-                    return translated, detected_code, confidence
-                else:
-                    err_msg = await resp.text()
-                    return (
-                        f"Azure API Error ({resp.status}): {err_msg}",
-                        "Unknown",
-                        0,
+                results = []
+                for item in data[0].get("translations", []):
+                    translated = restore_emotes_html(item.get("text", ""))
+                    target_code = item.get("to", "")
+                    results.append(
+                        (translated, target_code, detected_code, confidence)
                     )
+                return results
+            elif resp.status == 429:
+                print("Azure API error: Rate limit exceeded (429)")
+            elif resp.status in {401, 403}:
+                print("Azure API error: Authentication failed")
+            else:
+                print(f"Azure API error ({resp.status}): {await resp.text()}")
+    except asyncio.TimeoutError:
+        print("Azure API request timed out.")
     except Exception as e:
-        return f"Translation error: {e}", "Unknown", 0
+        print(f"Translation error: {e}")
+    return []
+
+
+# 5. Return None on Translation Failure instead of fake embed
+async def translate_single(
+    session: aiohttp.ClientSession, text: str, target_lang: str
+) -> tuple[str, str, int] | None:
+    res = await translate_text(session, text, [target_lang])
+    if res:
+        translated, _, src_lang, confidence = res[0]
+        return translated, src_lang, confidence
+    return None
 
 
 def build_translation_embed(
@@ -467,201 +595,235 @@ def build_translation_embed(
     )
     embed.set_thumbnail(url=author.display_avatar.url)
     embed.set_footer(
-        text=f"Original language: {src_name} ({src_code.lower()}) • Confidence: {confidence}% • Provider: Azure AI"
+        text=f"Original: {src_name} ({src_code.lower()}) • Confidence: {confidence}% • Provider: Azure AI"
     )
 
     return embed
 
 
 # ------------------------------------------------------------------------------
-# UI Components for /setchannellanguage
+# 15. Persistent UI Views across Restarts
 # ------------------------------------------------------------------------------
 
 
-class AddLanguageSelect(discord.ui.Select):
-    def __init__(self, parent_view):
+class GlobalTranslateView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Translate / 翻譯",
+        style=discord.ButtonStyle.secondary,
+        emoji="🌐",
+        custom_id="global_translate_button_v1",  # Explicit custom_id for persistence
+    )
+    async def translate_callback(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not interaction.message or not interaction.message.content:
+            await interaction.response.send_message(
+                "Unable to retrieve message content.", ephemeral=True
+            )
+            return
+
+        cleaned_text = strip_untranslatable_content(interaction.message.content)
+        if not cleaned_text:
+            await interaction.response.send_message(
+                "Cannot translate empty text or non-text elements.", ephemeral=True
+            )
+            return
+
+        user_lang = await asyncio.to_thread(
+            get_user_language_db, interaction.user.id
+        )
+
+        if not user_lang:
+            guide_embed = discord.Embed(
+                title="🌐 Set Target Language / 設定語言",
+                description="Please choose your target language below to complete translation:",
+                color=discord.Color.gold(),
+            )
+            prompt_view = LanguagePromptView(
+                cleaned_text, interaction.message.author
+            )
+            await interaction.response.send_message(
+                embed=guide_embed, view=prompt_view, ephemeral=True
+            )
+            return
+
+        result = await translate_single(
+            require_session(interaction.client), cleaned_text, user_lang
+        )
+
+        # 5. Handle failed translations explicitly
+        if result is None:
+            await interaction.response.send_message(
+                "⚠️ Translation failed or limit reached. Please try again later.",
+                ephemeral=True,
+            )
+            return
+
+        translated, src_lang, confidence = result
+        embed = build_translation_embed(
+            author=interaction.message.author,
+            translated_text=translated,
+            src_code=src_lang,
+            target_code=user_lang,
+            confidence=confidence,
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class LanguagePromptSelect(discord.ui.Select):
+
+    def __init__(
+        self, original_text: str, author: discord.User | discord.Member
+    ):
         options = [
             discord.SelectOption(label=name, value=code)
             for name, code in list(LANGUAGES.items())[:25]
         ]
         super().__init__(
-            placeholder="Select a language to add...",
+            placeholder="🌐 Choose language / 選擇語言...",
             min_values=1,
             max_values=1,
             options=options,
         )
-        self.parent_view = parent_view
+        self.original_text = original_text
+        self.author = author
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.parent_view.author_id:
+        selected_lang = self.values[0]
+        await asyncio.to_thread(
+            set_user_language_db, interaction.user.id, selected_lang
+        )
+        lang_name = get_clean_lang_name(selected_lang)
+
+        result = await translate_single(
+            require_session(interaction.client),
+            self.original_text,
+            selected_lang,
+        )
+
+        if result is None:
             await interaction.response.send_message(
-                "You are not allowed to control this menu.", ephemeral=True
+                "⚠️ Translation failed. Please try again later.", ephemeral=True
             )
             return
 
-        selected_lang = self.values[0]
-        add_channel_language_db(self.parent_view.channel.id, selected_lang)
-        await self.parent_view.refresh(interaction)
+        translated, src_lang, confidence = result
+        embed = build_translation_embed(
+            author=self.author,
+            translated_text=translated,
+            src_code=src_lang,
+            target_code=selected_lang,
+            confidence=confidence,
+        )
+
+        await interaction.response.send_message(
+            content=f"✅ Preferred language set to **{lang_name}** (`{selected_lang}`):",
+            embed=embed,
+            ephemeral=True,
+        )
 
 
-class RemoveLanguageSelect(discord.ui.Select):
-    def __init__(self, parent_view, current_langs: list[str]):
-        options = []
-        for lang_code in current_langs:
-            name = get_clean_lang_name(lang_code)
-            options.append(
-                discord.SelectOption(
-                    label=f"{name} ({lang_code})", value=lang_code
-                )
-            )
+class LanguagePromptView(discord.ui.View):
+
+    def __init__(
+        self, original_text: str, author: discord.User | discord.Member
+    ):
+        super().__init__(timeout=180)
+        self.add_item(LanguagePromptSelect(original_text, author))
+
+
+class WelcomeLanguageSelect(discord.ui.Select):
+
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, value=code)
+            for name, code in list(LANGUAGES.items())[:25]
+        ]
         super().__init__(
-            placeholder="Select a language to remove...",
+            placeholder="🌐 Choose your language...",
             min_values=1,
             max_values=1,
             options=options,
         )
-        self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.parent_view.author_id:
-            await interaction.response.send_message(
-                "You are not allowed to control this menu.", ephemeral=True
-            )
-            return
-
         selected_lang = self.values[0]
-        remove_channel_language_db(self.parent_view.channel.id, selected_lang)
-        await self.parent_view.refresh(interaction)
-
-
-class ChannelLanguageView(discord.ui.View):
-    def __init__(self, channel: discord.TextChannel, author_id: int):
-        super().__init__(timeout=120)
-        self.channel = channel
-        self.author_id = author_id
-        self.state = "main"
-        self.build_components()
-
-    def build_components(self):
-        self.clear_items()
-        current_langs = get_channel_languages_db(self.channel.id)
-
-        if self.state == "main":
-            add_btn = discord.ui.Button(
-                label="Add Language",
-                style=discord.ButtonStyle.primary,
-                emoji="➕",
-            )
-            add_btn.callback = self.on_add_click
-            self.add_item(add_btn)
-
-            rem_btn = discord.ui.Button(
-                label="Remove Language",
-                style=discord.ButtonStyle.danger,
-                emoji="➖",
-                disabled=len(current_langs) == 0,
-            )
-            rem_btn.callback = self.on_remove_click
-            self.add_item(rem_btn)
-
-        elif self.state == "add":
-            self.add_item(AddLanguageSelect(self))
-            back_btn = discord.ui.Button(
-                label="Back / Cancel", style=discord.ButtonStyle.secondary
-            )
-            back_btn.callback = self.on_back_click
-            self.add_item(back_btn)
-
-        elif self.state == "remove":
-            if current_langs:
-                self.add_item(RemoveLanguageSelect(self, current_langs))
-            back_btn = discord.ui.Button(
-                label="Back / Cancel", style=discord.ButtonStyle.secondary
-            )
-            back_btn.callback = self.on_back_click
-            self.add_item(back_btn)
-
-    def build_embed(self) -> discord.Embed:
-        current_langs = get_channel_languages_db(self.channel.id)
-        embed = discord.Embed(
-            title=f"⚙️ Target Languages for #{self.channel.name}",
-            color=discord.Color.purple(),
+        await asyncio.to_thread(
+            set_user_language_db, interaction.user.id, selected_lang
         )
-        if current_langs:
-            lang_list = "\n".join(
-                [
-                    f"• **{get_clean_lang_name(code)}** (`{code}`)"
-                    for code in current_langs
-                ]
-            )
-            embed.add_field(
-                name="Active Target Languages", value=lang_list, inline=False
-            )
-        else:
-            embed.add_field(
-                name="Active Target Languages",
-                value="*No target languages currently set.*",
-                inline=False,
-            )
-        embed.set_footer(
-            text="Use the controls below to add or remove default target languages."
-        )
-        return embed
+        lang_name = get_clean_lang_name(selected_lang)
 
-    async def refresh(self, interaction: discord.Interaction):
-        self.state = "main"
-        self.build_components()
-        await interaction.response.edit_message(
-            embed=self.build_embed(), view=self
+        await interaction.response.send_message(
+            f"✅ Preferred translation language set to **{lang_name}** (`{selected_lang}`)!",
+            ephemeral=True,
         )
 
-    async def on_add_click(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "You are not allowed to control this menu.", ephemeral=True
-            )
-            return
-        self.state = "add"
-        self.build_components()
-        await interaction.response.edit_message(
-            embed=self.build_embed(), view=self
-        )
 
-    async def on_remove_click(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "You are not allowed to control this menu.", ephemeral=True
-            )
-            return
-        self.state = "remove"
-        self.build_components()
-        await interaction.response.edit_message(
-            embed=self.build_embed(), view=self
-        )
+class WelcomeLanguageView(discord.ui.View):
 
-    async def on_back_click(self, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "You are not allowed to control this menu.", ephemeral=True
-            )
-            return
-        self.state = "main"
-        self.build_components()
-        await interaction.response.edit_message(
-            embed=self.build_embed(), view=self
-        )
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(WelcomeLanguageSelect())
 
 
 # ------------------------------------------------------------------------------
-# Bot Setup
+# Bot Setup & Unified Error Handlers
 # ------------------------------------------------------------------------------
+
+
+class TranslationBot(commands.Bot):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session: aiohttp.ClientSession | None = None
+
+    async def setup_hook(self):
+        # 6. Session Timeout Enforcement
+        timeout = aiohttp.ClientTimeout(total=20)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+
+        # 9. Non-blocking initialization
+        await asyncio.to_thread(init_db)
+
+        # 15. Register Persistent Global View
+        self.add_view(GlobalTranslateView())
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        await super().close()
+
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = TranslationBot(command_prefix="!", intents=intents)
+
+
+# 1. Global Tree Error Handler
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "⛔ You need the **Manage Channels** permission to execute this command."
+    elif isinstance(error, app_commands.CheckFailure):
+        msg = "⛔ You do not have permission to execute this command."
+    else:
+        print(f"App command error: {error}")
+        msg = "⚠️ An unexpected error occurred while processing your request."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 async def language_autocomplete(
@@ -676,173 +838,86 @@ async def language_autocomplete(
 
 @bot.event
 async def on_ready():
-    init_db()
-    print("Database connection initialized successfully.")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
+# 14. Guild Check for !sync
 @bot.command()
 @commands.is_owner()
 async def sync(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.send("This command can only be executed within a server.")
+        return
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
     await ctx.send(f"Synced {len(synced)} command(s) to this server.")
 
 
 # ------------------------------------------------------------------------------
-# Slash Commands & Context Menu App
+# Commands
 # ------------------------------------------------------------------------------
 
 
 @bot.tree.command(
-    name="setchannellanguage",
-    description="Manage default target auto-translation languages for a channel",
+    name="setglobalchat",
+    description="Toggle global language chat mode for a channel",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
-async def set_channel_language(
+async def set_global_chat(
     interaction: discord.Interaction,
     channel: discord.TextChannel | None = None,
 ):
     target_channel = channel or interaction.channel
     if not isinstance(target_channel, discord.TextChannel):
         await interaction.response.send_message(
-            "Please specify a text channel.", ephemeral=True
+            "Please specify a valid text channel.", ephemeral=True
         )
         return
 
-    view = ChannelLanguageView(target_channel, interaction.user.id)
-    embed = view.build_embed()
+    settings = await asyncio.to_thread(
+        get_cached_channel_settings, target_channel.id
+    )
+    new_status = not settings.get("is_global", False)
+
+    await asyncio.to_thread(
+        set_global_chat_channel_db, target_channel.id, new_status
+    )
+
+    status_str = "enabled" if new_status else "disabled"
     await interaction.response.send_message(
-        embed=embed, view=view, ephemeral=True
+        f"🌐 Global Language Chat mode has been **{status_str}** for {target_channel.mention}.",
+        ephemeral=True,
     )
 
 
 @bot.tree.command(
-    name="stats",
-    description="View real-time Azure AI character usage and monthly free limit progress",
+    name="setlanguage",
+    description="Set your personal target language for translations",
 )
-async def stats_command(interaction: discord.Interaction):
-    used = get_monthly_character_usage()
-    remaining = max(0, AZURE_MONTHLY_LIMIT - used)
-    progress_bar = generate_progress_bar(used, AZURE_MONTHLY_LIMIT)
-
-    embed = discord.Embed(
-        title="📊 Azure Translation Usage & Quota Tracker",
-        color=discord.Color.purple(),
-    )
-    embed.add_field(
-        name="Monthly Character Usage",
-        value=f"`{progress_bar}`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Used Characters", value=f"**{used:,}**", inline=True
-    )
-    embed.add_field(
-        name="Remaining Capacity", value=f"**{remaining:,}**", inline=True
-    )
-    embed.add_field(
-        name="Monthly Limit", value=f"**{AZURE_MONTHLY_LIMIT:,}**", inline=True
-    )
-    embed.set_footer(
-        text="Usage resets on the 1st of every month • Azure AI Free Tier"
-    )
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(
-    name="help",
-    description="View instructions and guide for using the Translator bot",
-)
-async def help_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    user_id = interaction.user.id
-    is_first_time = not has_user_seen_help(user_id)
-    target_lang = get_effective_user_language(interaction.user)
-
-    title = "🌐 Translator Bot Guide"
-    description = "Here is how to use translation features across the server!"
-
-    fields = [
-        (
-            "👤 Personal Target Language Settings",
-            "• **`/setlanguage`**: Override your preferred translation language.\n"
-            "• **`/mylanguage`**: Check your current active target language.\n"
-            "• **Role Auto-Detection**: If you haven't set a language manually, the bot automatically checks your server roles to pick your default!",
-        ),
-        (
-            "🚩 Quick Flag Reactions (Public)",
-            "React to any message with a flag to translate it directly in chat for everyone:\n"
-            "• 🇹🇼 ➔ **Traditional Chinese** (`zh-Hant`)\n"
-            "• 🇰🇷 ➔ **Korean** (`ko`)\n"
-            "• 🇷🇺 ➔ **Russian** (`ru`)\n"
-            "• 🇺🇸 ➔ **English** (`en`)\n"
-            "• 🌐 ➔ Sends a **private DM** translation using your personal target language.",
-        ),
-        (
-            "🖱️ Context Menu Translation",
-            "Right-click any message ➔ **Apps** ➔ **Translate** to receive a private translation card.",
-        ),
-        (
-            "⚙️ Admin & Utility Commands",
-            "• **`/stats`**: View current monthly character usage against the 2,000,000 Azure limit.\n"
-            "• **`/setchannellanguage`**: Add/remove automatic channel-wide target languages.\n"
-            "• **`/translatechannel`**: Add custom language-specific translation rules.\n"
-            "• **`/checkchannel`**: View active channel translation rules.\n"
-            "• **`/clearchannel`**: Remove a custom translation rule by index.",
-        ),
-    ]
-
-    footer_text = "Powered by Azure AI • Emote & Short Message Filter Active"
-
-    if target_lang.lower() != "en":
-        title, _, _ = await translate_text(title, target_lang)
-        description, _, _ = await translate_text(description, target_lang)
-        footer_text, _, _ = await translate_text(footer_text, target_lang)
-
-        async def translate_field(name: str, val: str):
-            t_name, _, _ = await translate_text(name, target_lang)
-            t_val, _, _ = await translate_text(val, target_lang)
-            return t_name, t_val
-
-        fields = await asyncio.gather(
-            *[translate_field(n, v) for n, v in fields]
+@app_commands.autocomplete(language=language_autocomplete)
+async def set_user_language(
+    interaction: discord.Interaction,
+    language: str,
+):
+    # 2. Strict Input Validation
+    if language not in VALID_LANGUAGE_CODES:
+        await interaction.response.send_message(
+            "Invalid language selection. Please select an option from the list.",
+            ephemeral=True,
         )
+        return
 
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.purple(),
+    await asyncio.to_thread(set_user_language_db, interaction.user.id, language)
+    lang_name = get_clean_lang_name(language)
+    await interaction.response.send_message(
+        f"Your translation language set to **{lang_name}** (`{language}`).",
+        ephemeral=True,
     )
-
-    if is_first_time:
-        first_time_msg = (
-            "🌍 **Select your preferred language / 請選擇您的首選語言 / 선호하는 언어를 선택하세요 / Выберите ваш язык:**\n\n"
-            "👉 Please run **`/setlanguage`** to set your default language!\n"
-            "• **EN:** Use `/setlanguage` to pick your preferred translation target.\n"
-            "• **ZH-TW:** 請輸入 `/setlanguage` 來選擇您的預設翻譯語言。\n"
-            "• **KO:** `/setlanguage` 명령어로 기본 번역 언어를 설정하세요.\n"
-            "• **RU:** Используйте `/setlanguage` для выбора основного языка."
-        )
-        embed.add_field(
-            name="✨ First-Time Setup / 語言設定 guidance",
-            value=first_time_msg,
-            inline=False,
-        )
-        mark_user_seen_help(user_id)
-
-    for name, value in fields:
-        embed.add_field(name=name, value=value, inline=False)
-
-    embed.set_footer(text=footer_text)
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
     name="translatechannel",
-    description="Set a rule to translate a specific detected language into a target language for a channel",
+    description="Set a rule to translate a specific language in a channel",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
 @app_commands.autocomplete(
@@ -855,157 +930,57 @@ async def translate_channel(
     detectlanguage: str,
     translatedlanguage: str,
 ):
-    add_custom_channel_translation_db(
-        channel.id, detectlanguage, translatedlanguage
+    # 2. Strict Input Validation for both parameters
+    if (
+        detectlanguage not in VALID_LANGUAGE_CODES
+        or translatedlanguage not in VALID_LANGUAGE_CODES
+    ):
+        await interaction.response.send_message(
+            "Invalid language selection. Please choose valid options from the list.",
+            ephemeral=True,
+        )
+        return
+
+    await asyncio.to_thread(
+        add_custom_channel_translation_db,
+        channel.id,
+        detectlanguage,
+        translatedlanguage,
     )
     src_name = get_clean_lang_name(detectlanguage)
     target_name = get_clean_lang_name(translatedlanguage)
     await interaction.response.send_message(
-        f"Added custom translation rule for {channel.mention}: **{src_name}** (`{detectlanguage}`) ➔ **{target_name}** (`{translatedlanguage}`).",
+        f"Added rule for {channel.mention}: **{src_name}** ➔ **{target_name}**.",
         ephemeral=True,
     )
 
 
 @bot.tree.command(
-    name="checkchannel",
-    description="Display translation settings and custom rules configured for a channel",
+    name="stats", description="View real-time Azure character usage and quota"
 )
-async def check_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel | None = None,
-):
-    target_channel = channel or interaction.channel
-    if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Please run this command in a text channel or specify a text channel parameter.",
-            ephemeral=True,
-        )
-        return
-
-    default_langs = get_channel_languages_db(target_channel.id)
-    custom_rules = get_custom_channel_translations_db(target_channel.id)
+async def stats_command(interaction: discord.Interaction):
+    used = await asyncio.to_thread(get_monthly_character_usage)
+    remaining = max(0, AZURE_MONTHLY_LIMIT - used)
+    progress_bar = generate_progress_bar(used, AZURE_MONTHLY_LIMIT)
 
     embed = discord.Embed(
-        title=f"⚙️ Translation Rules for #{target_channel.name}",
-        color=discord.Color.purple(),
+        title="📊 Azure Translation Usage Tracker", color=discord.Color.purple()
     )
-
-    if default_langs:
-        def_names = ", ".join(
-            [f"**{get_clean_lang_name(l)}** (`{l}`)" for l in default_langs]
-        )
-        embed.add_field(
-            name="🌐 Default Channel Target Languages",
-            value=def_names,
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="🌐 Default Channel Target Languages",
-            value="*None set (Use `/setchannellanguage` to configure)*",
-            inline=False,
-        )
-
-    if custom_rules:
-        rules_text = ""
-        for idx, (_, src, target) in enumerate(custom_rules, start=1):
-            src_name = get_clean_lang_name(src)
-            target_name = get_clean_lang_name(target)
-            rules_text += f"`[{idx}]` **{src_name}** (`{src}`) ➔ **{target_name}** (`{target}`)\n"
-        embed.add_field(
-            name="🔀 Custom Language Rules (`/translatechannel`)",
-            value=rules_text,
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="🔀 Custom Language Rules (`/translatechannel`)",
-            value="*No custom rules set*",
-            inline=False,
-        )
+    embed.add_field(
+        name="Monthly Character Usage",
+        value=f"`{progress_bar}`",
+        inline=False,
+    )
+    embed.add_field(
+        name="Used Characters", value=f"**{used:,}**", inline=True
+    )
+    embed.add_field(
+        name="Remaining Capacity", value=f"**{remaining:,}**", inline=True
+    )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(
-    name="clearchannel",
-    description="Remove a custom translation rule from a channel using its index number",
-)
-@app_commands.checks.has_permissions(manage_channels=True)
-async def clear_channel(
-    interaction: discord.Interaction,
-    index: int,
-    channel: discord.TextChannel | None = None,
-):
-    target_channel = channel or interaction.channel
-    if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Please run this command in a text channel or specify a text channel parameter.",
-            ephemeral=True,
-        )
-        return
-
-    deleted_rule = delete_custom_channel_translation_by_index_db(
-        target_channel.id, index
-    )
-    if deleted_rule:
-        src_lang, target_lang = deleted_rule
-        src_name = get_clean_lang_name(src_lang)
-        target_name = get_clean_lang_name(target_lang)
-        await interaction.response.send_message(
-            f"Removed rule `[{index}]` from {target_channel.mention}: **{src_name}** (`{src_lang}`) ➔ **{target_name}** (`{target_lang}`).",
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            f"Invalid rule index `[{index}]` for {target_channel.mention}. Use `/checkchannel` to list active rules and their indices.",
-            ephemeral=True,
-        )
-
-
-@bot.tree.command(
-    name="setlanguage",
-    description="Set your personal default target language for translations",
-)
-@app_commands.autocomplete(language=language_autocomplete)
-async def set_user_language(
-    interaction: discord.Interaction,
-    language: str,
-):
-    set_user_language_db(interaction.user.id, language)
-    lang_name = get_clean_lang_name(language)
-    await interaction.response.send_message(
-        f"Your personal translation language has been set to **{lang_name}** (`{language}`).",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(
-    name="mylanguage",
-    description="Check your current personal target language setting",
-)
-async def my_language(interaction: discord.Interaction):
-    db_lang = get_user_language_db(interaction.user.id)
-    effective_lang = get_effective_user_language(interaction.user)
-    lang_name = get_clean_lang_name(effective_lang)
-
-    if db_lang:
-        msg = f"Your target language is manually set to **{lang_name}** (`{effective_lang}`)."
-    elif (
-        isinstance(interaction.user, discord.Member)
-        and any(
-            r.name.strip().lower() in ROLE_LANGUAGES
-            for r in interaction.user.roles
-        )
-    ):
-        msg = f"Your target language is set to **{lang_name}** (`{effective_lang}`) based on your server roles."
-    else:
-        msg = f"Your target language is defaulting to **English** (`en`). Use `/setlanguage` to override it."
-
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-# Context Menu Translate App
 @bot.tree.context_menu(name="Translate")
 async def translate_context_menu(
     interaction: discord.Interaction, message: discord.Message
@@ -1013,16 +988,22 @@ async def translate_context_menu(
     cleaned_content = strip_untranslatable_content(message.content)
     if not cleaned_content:
         await interaction.response.send_message(
-            "Cannot translate empty text, URLs, code blocks, or pure emojis.",
-            ephemeral=True,
+            "Cannot translate empty text or non-text elements.", ephemeral=True
         )
         return
 
-    target_lang = get_effective_user_language(interaction.user)
-    translated, src_lang, score = await translate_text(
-        cleaned_content, target_lang
+    target_lang = await get_effective_user_language_async(interaction.user)
+    result = await translate_single(
+        require_session(bot), cleaned_content, target_lang
     )
 
+    if result is None:
+        await interaction.response.send_message(
+            "⚠️ Translation failed or quota limit reached.", ephemeral=True
+        )
+        return
+
+    translated, src_lang, score = result
     embed = build_translation_embed(
         author=message.author,
         translated_text=translated,
@@ -1035,74 +1016,82 @@ async def translate_context_menu(
 
 
 # ------------------------------------------------------------------------------
-# Events (Auto-Translate & Reaction Listeners)
+# Event Handlers
 # ------------------------------------------------------------------------------
 
 
 @bot.event
 async def on_message(message: discord.Message):
+    # 12/13. Correct bot filter and process command execution
     if message.author.bot or not message.guild:
-        return
-
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
         return
 
     if not is_worth_translating(message.content):
         await bot.process_commands(message)
         return
 
-    text_to_translate = strip_untranslatable_content(message.content)
+    settings = await asyncio.to_thread(
+        get_cached_channel_settings, message.channel.id
+    )
+    is_global = settings.get("is_global", False)
 
-    custom_rules = get_custom_channel_translations_db(message.channel.id)
-    default_target_langs = get_channel_languages_db(message.channel.id)
+    if is_global:
+        try:
+            await message.add_reaction("🌐")
+        except Exception:
+            pass
+    else:
+        defaults = settings.get("defaults", [])
+        rules = settings.get("rules", [])
 
-    if not custom_rules and not default_target_langs:
-        await bot.process_commands(message)
-        return
+        if defaults or rules:
+            text_to_translate = strip_untranslatable_content(message.content)
+            if text_to_translate:
+                src_lang, _ = await detect_text_language(
+                    require_session(bot), text_to_translate
+                )
+                target_langs = set()
 
-    detected_lang, _ = await detect_text_language(text_to_translate)
+                for _, rule_src, rule_target in rules:
+                    if is_lang_match(src_lang, rule_src):
+                        target_langs.add(rule_target)
 
-    target_langs = []
+                for def_lang in defaults:
+                    if not is_lang_match(src_lang, def_lang):
+                        target_langs.add(def_lang)
 
-    # 1. Collect targets from custom channel rules
-    if custom_rules:
-        for _, src, target in custom_rules:
-            if is_lang_match(detected_lang, src):
-                if target not in target_langs:
-                    target_langs.append(target)
-
-    # 2. Collect targets from default channel languages
-    if default_target_langs:
-        for default_lang in default_target_langs:
-            if not is_lang_match(detected_lang, default_lang):
-                if default_lang not in target_langs:
-                    target_langs.append(default_lang)
-
-    # 3. Translate and send embed cards for all applicable targets
-    for target_lang in target_langs:
-        translated, src_lang, confidence = await translate_text(
-            text_to_translate, target_lang
-        )
-
-        if not is_lang_match(src_lang, target_lang):
-            embed = build_translation_embed(
-                author=message.author,
-                translated_text=translated,
-                src_code=src_lang,
-                target_code=target_lang,
-                confidence=confidence,
-            )
-            await message.channel.send(embed=embed)
+                if target_langs:
+                    translations = await translate_text(
+                        require_session(bot),
+                        text_to_translate,
+                        list(target_langs),
+                    )
+                    for (
+                        translated_text,
+                        target_code,
+                        detected_code,
+                        score,
+                    ) in translations:
+                        embed = build_translation_embed(
+                            author=message.author,
+                            translated_text=translated_text,
+                            src_code=detected_code,
+                            target_code=target_code,
+                            confidence=score,
+                        )
+                        await message.reply(embed=embed, mention_author=False)
 
     await bot.process_commands(message)
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    emoji_str = str(payload.emoji)
+    # 3. Guard against bot.user being None
+    if bot.user and payload.user_id == bot.user.id:
+        return
 
-    if emoji_str not in FLAG_TRANSLATIONS and emoji_str != "🌐":
+    emoji_str = str(payload.emoji)
+    if emoji_str != "🌐" and emoji_str not in FLAG_TRANSLATIONS:
         return
 
     channel = bot.get_channel(payload.channel_id)
@@ -1125,45 +1114,42 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         if not text_to_translate:
             return
 
-        if emoji_str in FLAG_TRANSLATIONS:
+        # Handle 🌐 Prompt Button
+        if emoji_str == "🌐":
+            clean_prompted_messages_cache()
+            if payload.message_id in PROMPTED_MESSAGES:
+                return
+
+            PROMPTED_MESSAGES[payload.message_id] = datetime.now(
+                timezone.utc
+            ).timestamp()
+            view = GlobalTranslateView()
+            await message.reply(
+                content="🌐 **Translate Here • 點擊翻譯 • 翻訳 • 번역**",
+                view=view,
+                mention_author=False,
+            )
+
+        # Handle Flag Emojis
+        else:
             target_lang = FLAG_TRANSLATIONS[emoji_str]
-            translated, src_lang, confidence = await translate_text(
-                text_to_translate, target_lang
+            result = await translate_single(
+                require_session(bot), text_to_translate, target_lang
             )
-
-            embed = build_translation_embed(
-                author=message.author,
-                translated_text=translated,
-                src_code=src_lang,
-                target_code=target_lang,
-                confidence=confidence,
-            )
-            await channel.send(embed=embed)
-
-        elif emoji_str == "🌐":
-            guild = (
-                bot.get_guild(payload.guild_id) if payload.guild_id else None
-            )
-            member = guild.get_member(user.id) if guild else user
-            target_lang = get_effective_user_language(member or user)
-
-            translated, src_lang, confidence = await translate_text(
-                text_to_translate, target_lang
-            )
-
-            embed = build_translation_embed(
-                author=message.author,
-                translated_text=translated,
-                src_code=src_lang,
-                target_code=target_lang,
-                confidence=confidence,
-            )
-            await user.send(embed=embed)
+            if result:
+                translated, src_lang, confidence = result
+                embed = build_translation_embed(
+                    author=message.author,
+                    translated_text=translated,
+                    src_code=src_lang,
+                    target_code=target_lang,
+                    confidence=confidence,
+                )
+                await message.reply(embed=embed, mention_author=False)
 
     except Exception as e:
-        print(f"Error handling reaction translation: {e}")
+        print(f"Reaction translation error: {e}")
 
 
-# Start Bot
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
