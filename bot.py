@@ -865,14 +865,18 @@ async def checkuserlanguage(interaction: discord.Interaction, user: discord.Memb
         f"{user.mention}: {LANGUAGES.get(language, language)} (`{language}`)",
         ephemeral=True,
     )
-    @bot.tree.command(
-        name="azurequota",
-        description="Check Azure Translator status, rate limits and how to view remaining quota.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.checks.has_permissions(administrator=True)
-    async def azurequota(interaction: discord.Interaction):
+
+
+
+@bot.tree.command(
+    name="azurequota",
+    description="Check Azure Translator status, rate limits and how to view remaining quota.",
+)
+@app_commands.guild_only
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def azurequota(interaction: discord.Interaction):
+
         """Probe Azure Translator and show useful quota / limit information."""
         try:
             # Tiny probe so we can read response headers
