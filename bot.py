@@ -153,7 +153,8 @@ class Store:
 
     async def user_language(self, uid, locale=None):
         """Replace a provisional join/reaction default only when a real locale arrives."""
-        language = canonical(locale or "EN-US")
+        loc = locale.value if locale and hasattr(locale, "value") else (locale or "EN-US")
+        language = canonical(loc)
         if language not in engine.targets:
             language = canonical(language.split("-")[0])
         if language not in engine.targets:
