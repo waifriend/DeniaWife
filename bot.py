@@ -865,6 +865,86 @@ async def checkuserlanguage(interaction: discord.Interaction, user: discord.Memb
         f"{user.mention}: {LANGUAGES.get(language, language)} (`{language}`)",
         ephemeral=True,
     )
+    @bot.tree.command(
+        name="azurequota",
+        description="Check Azure Translator status, rate limits and how to view remaining quota.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def azurequota(interaction: discord.Interaction):
+        """Probe Azure Translator and show useful quota / limit information."""
+        try:
+            # Tiny probe so we can read response headers
+            def probe():
+                headers = {
+                    "Ocp-Apim-Subscription-Key": AZURE_KEY,
+                    "Ocp-Apim-Subscription-Region": AZURE_REGION,
+                    "Content-Type": "application/json",
+                    "X-ClientTraceId": str(uuid.uuid4()),
+                }
+                params = {"api-version": "3.0", "to": "en"}
+                body = [{"text": "hi"}]          # 2 characters
+                resp = requests.post(
+                    f"{engine.endpoint}/translate",
+                    params=params,
+                    headers=headers,
+                    json=body,
+                    timeout=15,
+                )
+                return resp
+
+            resp = await asyncio.to_thread(probe)
+
+            # Collect useful header information
+            metered = resp.headers.get("X-Metered-Usage") or resp.headers.get("x-metered-usage")
+            request_id = resp.headers.get("X-RequestId") or resp.headers.get("x-requestid")
+            status = resp.status_code
+
+            if status == 200:
+                status_text = "✅ Azure Translator is reachable"
+            elif status == 429:
+                status_text = "⚠️ Rate limited / quota exceeded (HTTP 429)"
+            elif status in (401, 403):
+                status_text = "❌ Authentication failed – check key / region"
+            else:
+                status_text = f"⚠️ Unexpected status {status}"
+
+            # Known hard limits (official documentation)
+            limits = (
+                "**Known hard limits (per Azure docs)**\n"
+                "• **F0 (Free)** – 2 000 000 characters / month  +  ~33 300 characters / minute\n"
+                "• **S1** – 40 000 000 characters / hour\n"
+                "• **S2 / C2** – 40 000 000 characters / hour\n"
+                "• **S3 / C3** – 120 000 000 characters / hour\n"
+                "• **S4 / C4** – 200 000 000 characters / hour\n\n"
+                "Paid tiers are pay-as-you-go. There is **no simple remaining-quota API**."
+            )
+
+            msg = (
+                f"{status_text}\n\n"
+                f"**Probe result**\n"
+                f"• HTTP status: `{status}`\n"
+                f"• Characters billed for this probe: `{metered or 'n/a'}`\n"
+                f"• Request ID: `{request_id or 'n/a'}`\n"
+                f"• Region used: `{AZURE_REGION}`\n\n"
+                f"{limits}\n\n"
+                "**How to see real usage**\n"
+                "1. Open [Azure Portal](https://portal.azure.com)\n"
+                "2. Go to your **Translator** resource\n"
+                "3. Left menu → **Metrics**\n"
+                "4. Metric = **Text Characters Translated** (Sum)\n"
+                "5. Set the desired time range (Last 24 h / 30 days / billing period)"
+            )
+
+            await interaction.followup.send(msg, ephemeral=True)
+
+        except Exception as e:
+            log.exception("azurequota command failed")
+            await interaction.followup.send(
+                f"Failed to contact Azure Translator:\n```{e}```",
+                ephemeral=True,
+            )
 
 
 if __name__ == "__main__":
