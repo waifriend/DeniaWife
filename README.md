@@ -1,24 +1,46 @@
-# Discord Translation Bot
+DeniaWife
 
-A Discord bot powered by **Azure AI Translator** and **Turso** that automatically translates channel messages and lets users translate on demand into their preferred language.
+Personal Discord translation bot powered by DeepL and Turso (LibSQL).
 
-## Features
+Setup
 
-| Feature | How |
-|---|---|
-| **Set your language** | `/setlanguage` slash command |
-| **Check your language** | `/mylanguage` slash command |
-| **Auto-translation** | Translates messages sent in configured multi-language channels |
-| **Translate via reaction** | Add 🌐 reaction to any message → Bot DMs you the translation |
-| **Translate via popup** | Right-click message → Apps → **Translate** → Private ephemeral message |
+Install requirements:
 
-## Environment Variables
+pip install discord.py deepl libsql-experimental python-dotenv emoji
 
-Ensure the following variables are set in your `.env` file or hosting provider (Koyeb/Render):
 
-```env
-DISCORD_TOKEN=your_discord_bot_token
-AZURE_TRANSLATE_KEY=your_azure_key
-AZURE_TRANSLATE_REGION=your_azure_region
-TURSO_DATABASE_URL=libsql://your-db.turso.io
+Create a .env file:
+
+DISCORD_TOKEN=your_token
+DEEPL_AUTH_KEY=your_deepl_key
+TURSO_DATABASE_URL=your_turso_url
 TURSO_AUTH_TOKEN=your_turso_token
+
+
+Run the bot:
+
+python bot.py
+
+
+Sync commands in Discord:
+Run !sync as the bot owner in your server.
+
+Features & Usage
+
+Flag Reactions: React with a flag (🇺🇸, 🇯🇵, 🇰🇷, 🇹🇼, etc.) to translate a message.
+
+Global Mode: Channel 🌐 reactions for interactive button translations.
+
+Context Menu: Right-click message → Apps → Translate.
+
+Commands:
+
+/setselflanguage <lang> — Set target language.
+
+/selflanguage — View target language.
+
+/setglobalchannel <channel> <true/false> — Toggle globe mode.
+
+/setchannellanguage <channel> <lang> — Auto-translate channel setting.
+
+/translate <channel> <src> <tgt> — Set specific translation rule.
