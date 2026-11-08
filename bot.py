@@ -578,7 +578,7 @@ async def setglobalchannel(
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.autocomplete(
-    targeted_language=source_choices, translated_language=language_choices
+    targeted_language=language_choices, translated_language=language_choices
 )
 async def translate(
     interaction: discord.Interaction,
@@ -587,7 +587,9 @@ async def translate(
     translated_language: str,
     enabled: bool = True,
 ):
-    source, target = engine.source(targeted_language), engine.target(translated_language)
+    source = engine.source(targeted_language)
+    target = engine.target(translated_language)
+
     args = (str(interaction.guild_id), str(channel.id), source, target)
     if enabled:
         if family(source) == family(target):
