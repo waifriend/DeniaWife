@@ -478,6 +478,7 @@ class Bot(commands.Bot):
         await engine.setup()
         await store.setup()
         self.add_view(TranslateView())
+        self.add_view(LanguageSelectView())
 
     def limited(self, key, seconds=5):
         now = time.monotonic()
@@ -495,6 +496,39 @@ class Bot(commands.Bot):
             await super().close()
         finally:
             await store.close()
+
+
+class LanguageSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name, value=code)
+            for code, name in list(LANGUAGES.items())[:25]
+        ]
+        super().__init__(
+            placeholder="Choose your preferred language...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="tr2:language_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        code = self.values[0]
+        await store.sql(
+            "INSERT INTO tr2_users VALUES(?,?,'manual') "
+            "ON CONFLICT(user_id) DO UPDATE SET language=excluded.language,origin='manual'",
+            (str(interaction.user.id), code),
+        )
+        await interaction.response.send_message(
+            f"Your language has been set to {LANGUAGES[code]} (`{code}`).", ephemeral=True
+        )
+
+
+class LanguageSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(LanguageSelect())
+
 
 
 bot = Bot()
@@ -723,8 +757,20 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    if not member.bot:
-        await store.user_language(member.id)
+    if member.bot:
+        return
+    await store.user_language(member.id)
+    try:
+        embed = discord.Embed(
+            title="Welcome! Please choose your language",
+            description="Please select your preferred translation language using the dropdown menu below.",
+            color=0xB05CC6,
+        )
+        await member.send(embed=embed, view=LanguageSelectView())
+    except discord.Forbidden:
+        log.info("DM blocked for new member %s", member.id)
+    except Exception:
+        log.exception("Failed to send language selection DM to %s", member.id)
 
 
 @bot.event
@@ -873,6 +919,33 @@ async def checkuserlanguage(interaction: discord.Interaction, user: discord.Memb
         f"{user.mention}: {LANGUAGES.get(language, language)} (`{language}`)",
         ephemeral=True,
     )
+
+@bot.tree.command(
+    name="sendlanguagerequest",
+    description="Administrator: send a language selection DM to a member.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(user="Member to send the language selection request to")
+async def sendlanguagerequest(interaction: discord.Interaction, user: discord.Member):
+    if user.bot:
+        raise ValueError("Cannot send a language request to a bot.")
+    try:
+        embed = discord.Embed(
+            title="Language Selection Request",
+            description="Please select your preferred translation language using the dropdown menu below.",
+            color=0xB05CC6,
+        )
+        await user.send(embed=embed, view=LanguageSelectView())
+        await interaction.followup.send(
+            f"Successfully sent language selection request to {user.mention}.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        raise ValueError(f"Could not send DM to {user.mention}. Their DMs might be closed.")
+
+
 
 
 if __name__ == "__main__":
