@@ -127,25 +127,43 @@ class Store:
         self.conn = None
 
     async def sql(self, statement, args=()):
-            def execute():
-                for attempt in range(2):
+        def execute():
+            last_exc = None
+            for attempt in range(2):
+                try:
                     if self.conn is None:
                         self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_KEY)
+
+                    cursor = self.conn.execute(statement, args)
+                    rows = cursor.fetchall() if statement.lstrip().upper().startswith("SELECT") else []
+                    self.conn.commit()
+                    return rows
+
+                except Exception as exc:
+                    last_exc = exc
+                    err_msg = str(exc).lower()
+
+                    is_connection_error = any(k in err_msg for k in (
+                        "404", "stream not found", "connection", "network",
+                        "timeout", "closed", "reset", "broken", "eof"
+                    ))
+
                     try:
-                        cursor = self.conn.execute(statement, args)
-                        rows = cursor.fetchall() if statement.lstrip().upper().startswith("SELECT") else []
-                        self.conn.commit()
-                        return rows
+                        if self.conn:
+                            self.conn.rollback()
                     except Exception:
-                        try:
-                            if self.conn:
-                                self.conn.rollback()
-                        except Exception:
-                            pass
-                        self.conn = None  # Drop stale connection so it reconnects fresh on retry
+                        pass
+
+                    if is_connection_error:
+                        self.conn = None
                         if attempt == 1:
-                            raise
-            return await asyncio.get_running_loop().run_in_executor(self.worker, execute)
+                            raise last_exc
+                    else:
+                        raise
+
+            raise last_exc
+
+        return await asyncio.get_running_loop().run_in_executor(self.worker, execute)
 
     async def setup(self):
         for statement in (
@@ -300,6 +318,7 @@ class Engine:
             raise ValueError("This message has no suitable text to translate.")
         target = self.target(target)
         key = (text, target)
+
         async with self.lock:
             cached = self.cache.get(key)
             if cached and time.monotonic() - cached[0] < 900:
@@ -316,10 +335,7 @@ class Engine:
                     "Content-Type": "application/json",
                     "X-ClientTraceId": str(uuid.uuid4()),
                 }
-                params = {
-                    "api-version": "3.0",
-                    "to": azure_target,
-                }
+                params = {"api-version": "3.0", "to": azure_target}
                 body = [{"text": xml}]
                 resp = requests.post(
                     f"{self.endpoint}/translate",
@@ -328,6 +344,8 @@ class Engine:
                     json=body,
                     timeout=30,
                 )
+                if resp.status_code == 429:
+                    raise ValueError("Azure Translator rate limit / quota exceeded. Try again later.")
                 resp.raise_for_status()
                 return resp.json()
 
@@ -339,8 +357,16 @@ class Engine:
             detected = data[0].get("detectedLanguage", {}).get("language", "en")
             detected_internal = self._from_azure(detected)
 
-            # Restore protected slots (same algorithm as before)
-            root = ET.fromstring(f"<root>{translated_xml}</root>" if not translated_xml.startswith("<root>") else translated_xml)
+            try:
+                if not translated_xml.startswith("<root>"):
+                    translated_xml = f"<root>{translated_xml}</root>"
+                root = ET.fromstring(translated_xml)
+            except ET.ParseError as e:
+                raise ValueError(
+                    "Azure returned unparseable translation output. "
+                    "The protected-content restore step failed."
+                ) from e
+
             found = []
             for node in root.iter("keep"):
                 index = int(node.text or "-1")
@@ -348,6 +374,7 @@ class Engine:
                     raise ValueError("Protected content could not be restored safely.")
                 found.append(index)
                 node.text = slots[index]
+
             if sorted(found) != list(range(len(slots))):
                 raise ValueError("Translation changed protected content; refusing unsafe output.")
 
@@ -397,10 +424,13 @@ async def private_error(interaction, text):
 
 
 class Tree(app_commands.CommandTree):
-    async def interaction_check(self, interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # Do not initialize a language during read-only inspection.
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+            except discord.HTTPException as e:
+                log.warning("Could not defer interaction %s: %s", interaction.id, e)
+        # Do not initialize a language during read-only inspection
         if (
             interaction.command is None
             or interaction.command.name != "checkuserlanguage"
@@ -411,15 +441,20 @@ class Tree(app_commands.CommandTree):
             )
         return True
 
-    async def on_error(self, interaction, error):
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
         cause = getattr(error, "original", error)
         log.error("Slash command failed", exc_info=(type(cause), cause, cause.__traceback__))
         if isinstance(cause, (ValueError, app_commands.CheckFailure)):
             text = str(cause)
         else:
             text = "The operation failed. Check the bot logs, Azure quota, and Turso connection."
-        await private_error(interaction, text)
-
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            log.warning("Could not send error message for interaction %s", interaction.id)
 
 class TranslateView(discord.ui.View):
     """A stateless persistent button; the reply reference identifies its source."""
@@ -501,8 +536,8 @@ class Bot(commands.Bot):
 class LanguageSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label=name, value=code)
-            for code, name in list(LANGUAGES.items())[:25]
+            discord.SelectOption(label=name[:100], value=code)
+            for code, name in sorted(LANGUAGES.items(), key=lambda x: x[1])[:25]
         ]
         super().__init__(
             placeholder="Choose your preferred language...",
@@ -520,7 +555,8 @@ class LanguageSelect(discord.ui.Select):
             (str(interaction.user.id), code),
         )
         await interaction.response.send_message(
-            f"Your language has been set to {LANGUAGES[code]} (`{code}`).", ephemeral=True
+            f"Your language has been set to {LANGUAGES.get(code, code)} (`{code}`).",
+            ephemeral=True,
         )
 
 
@@ -814,20 +850,24 @@ async def on_message(message):
         for target in sorted(targets):
             try:
                 result = (
-                    probe
-                    if target == probe_target
+                    probe if target == probe_target
                     else await engine.translate(message.content, target)
                 )
                 if unchanged_translation(message.content, result.text):
                     continue
-                await message.reply(
-                    embeds=embeds(message, result),
-                    mention_author=False,
-                )
+
+                try:
+                    await message.reply(embeds=embeds(message, result), mention_author=False)
+                except discord.HTTPException as e:
+                    # 429, 500, Forbidden, etc. – just log briefly
+                    log.warning(
+                        "Failed to send translation reply in channel %s: %s",
+                        message.channel.id, e
+                    )
             except Exception:
                 log.exception("Automatic translation target %s failed", target)
     except Exception:
-        log.exception("Message processing failed for %s", message.id)
+            log.exception("Message processing failed for %s", message.id)
 
 
 @bot.event
@@ -893,6 +933,8 @@ async def on_raw_reaction_add(payload):
                 await member.send(embeds=embeds(original, result))
             except discord.Forbidden:
                 log.info("DM blocked for user %s", member.id)
+            except discord.HTTPException as e:
+                log.warning("Failed to DM translation to %s: %s", member.id, e)
     except Exception:
         log.exception("Reaction translation failed for message %s", payload.message_id)
 
