@@ -3,7 +3,6 @@ Turso is used for storing server configurations. No personal or server data is s
 Translation provider: Azure Translator.
 """
 from __future__ import annotations
-
 import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +14,6 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -129,18 +127,25 @@ class Store:
         self.conn = None
 
     async def sql(self, statement, args=()):
-        def execute():
-            if self.conn is None:
-                self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_KEY)
-            try:
-                cursor = self.conn.execute(statement, args)
-                rows = cursor.fetchall() if statement.lstrip().upper().startswith("SELECT") else []
-                self.conn.commit()
-                return rows
-            except Exception:
-                self.conn.rollback()
-                raise
-        return await asyncio.get_running_loop().run_in_executor(self.worker, execute)
+            def execute():
+                for attempt in range(2):
+                    if self.conn is None:
+                        self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_KEY)
+                    try:
+                        cursor = self.conn.execute(statement, args)
+                        rows = cursor.fetchall() if statement.lstrip().upper().startswith("SELECT") else []
+                        self.conn.commit()
+                        return rows
+                    except Exception:
+                        try:
+                            if self.conn:
+                                self.conn.rollback()
+                        except Exception:
+                            pass
+                        self.conn = None  # Drop stale connection so it reconnects fresh on retry
+                        if attempt == 1:
+                            raise
+            return await asyncio.get_running_loop().run_in_executor(self.worker, execute)
 
     async def setup(self):
         for statement in (
