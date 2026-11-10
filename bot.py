@@ -3,6 +3,7 @@ Turso is used for storing server configurations. No personal or server data is s
 Translation provider: Azure Translator.
 """
 from __future__ import annotations
+
 import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,8 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
+from typing import ClassVar
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -36,12 +39,11 @@ def required(name: str) -> str:
 
 TOKEN = required("DISCORD_TOKEN")
 AZURE_KEY = required("AZURE_TRANSLATOR_KEY")
-AZURE_REGION = required("AZURE_TRANSLATOR_REGION")  # e.g. "eastus", "global", "westeurope"
+AZURE_REGION = required("AZURE_TRANSLATOR_REGION")
 TURSO_URL = required("TURSO_DATABASE_URL")
 TURSO_KEY = required("TURSO_AUTH_TOKEN")
 GLOBE = "🌐"
 
-# Internal codes (unchanged from previous version)
 LANGUAGES = {
     "AR": "Arabic", "BG": "Bulgarian", "CS": "Czech", "DA": "Danish",
     "DE": "German", "EL": "Greek", "EN-US": "English (US)",
@@ -75,7 +77,6 @@ FLAGS = {
     "🇸🇦": "AR", "🇻🇳": "VI", "🇹🇭": "TH", "🇮🇳": "HI", "🇮🇱": "HE",
 }
 
-# Internal code → Azure Translator code
 TO_AZURE = {
     "AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de",
     "EL": "el", "EN-US": "en", "EN-GB": "en", "ES": "es", "ET": "et",
@@ -87,7 +88,6 @@ TO_AZURE = {
     "UK": "uk", "VI": "vi", "ZH-HANS": "zh-Hans", "ZH-HANT": "zh-Hant",
 }
 
-# Azure code → preferred internal code (for detected_source_lang)
 FROM_AZURE = {
     "ar": "AR", "bg": "BG", "cs": "CS", "da": "DA", "de": "DE",
     "el": "EL", "en": "EN-US", "es": "ES", "et": "ET", "fi": "FI",
@@ -114,14 +114,12 @@ def family(code: str) -> str:
 
 
 def unchanged_translation(original: str, translated: str) -> bool:
-    """Ignore whitespace differences when checking for redundant output."""
     def normalize(text):
         return re.sub(r"\s+", " ", text).strip()
     return normalize(original) == normalize(translated)
 
 
 class Store:
-    """Serialize all remote SQL on one worker; never block Discord's event loop."""
     def __init__(self):
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="turso")
         self.conn = None
@@ -133,49 +131,54 @@ class Store:
                 try:
                     if self.conn is None:
                         self.conn = libsql.connect(TURSO_URL, auth_token=TURSO_KEY)
-
                     cursor = self.conn.execute(statement, args)
                     rows = cursor.fetchall() if statement.lstrip().upper().startswith("SELECT") else []
                     self.conn.commit()
                     return rows
-
                 except Exception as exc:
                     last_exc = exc
                     err_msg = str(exc).lower()
-
                     is_connection_error = any(k in err_msg for k in (
                         "404", "stream not found", "connection", "network",
                         "timeout", "closed", "reset", "broken", "eof"
                     ))
-
                     try:
                         if self.conn:
                             self.conn.rollback()
                     except Exception:
                         pass
-
                     if is_connection_error:
                         self.conn = None
                         if attempt == 1:
                             raise last_exc
                     else:
                         raise
-
             raise last_exc
-
         return await asyncio.get_running_loop().run_in_executor(self.worker, execute)
 
     async def setup(self):
-        for statement in (
+        statements = [
             "CREATE TABLE IF NOT EXISTS tr2_users (user_id TEXT PRIMARY KEY, language TEXT NOT NULL, origin TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS tr2_channels (guild_id TEXT NOT NULL, channel_id TEXT PRIMARY KEY, language TEXT, is_global INTEGER NOT NULL DEFAULT 0)",
+            """CREATE TABLE IF NOT EXISTS tr2_channels (
+                guild_id TEXT NOT NULL,
+                channel_id TEXT PRIMARY KEY,
+                language TEXT,
+                is_global INTEGER NOT NULL DEFAULT 0,
+                is_proxy INTEGER NOT NULL DEFAULT 0
+            )""",
             "CREATE TABLE IF NOT EXISTS tr2_rules (guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY(channel_id,source,target))",
             "CREATE TABLE IF NOT EXISTS tr2_prompts (original_id TEXT PRIMARY KEY, prompt_id TEXT NOT NULL, channel_id TEXT NOT NULL)",
-        ):
+        ]
+        for statement in statements:
             await self.sql(statement)
 
+        # Safe migration for existing installations
+        try:
+            await self.sql("ALTER TABLE tr2_channels ADD COLUMN is_proxy INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass  # column already exists
+
     async def user_language(self, uid, locale=None):
-        """Replace a provisional join/reaction default only when a real locale arrives."""
         loc = locale.value if locale and hasattr(locale, "value") else (locale or "EN-US")
         language = canonical(loc)
         if language not in engine.targets:
@@ -197,7 +200,6 @@ class Store:
         self.worker.shutdown(wait=True)
 
 
-# Protect code, URLs/domains, Discord syntax, email addresses and every Unicode emoji.
 PROTECTED = re.compile(
     r"```[\s\S]*?```|`[^`\n]*`|https?://[^\s<>]+|www\.[^\s<>]+"
     r"|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"
@@ -207,7 +209,6 @@ PROTECTED = re.compile(
 
 
 def prepare(text):
-    """Return XML with immutable slots, plus text suitable for skip heuristics."""
     spans = [(m.start(), m.end()) for m in PROTECTED.finditer(text)]
     spans += [(m["match_start"], m["match_end"]) for m in emoji.emoji_list(text)]
     merged = []
@@ -229,7 +230,6 @@ def prepare(text):
 
 
 def eligible(text):
-    """Conservative heuristic, not a promise to recognize every nonsense string."""
     if not text.strip() or text.lstrip().startswith(("/", "!")):
         return False
     plain = prepare(text)[1]
@@ -252,8 +252,6 @@ class Translation:
 
 
 class Engine:
-    """Azure Translator, bounded TTL caching and serialized cache-fill requests."""
-
     def __init__(self):
         self.endpoint = "https://api.cognitive.microsofttranslator.com"
         self.targets = {}
@@ -262,7 +260,6 @@ class Engine:
         self.lock = asyncio.Lock()
 
     async def setup(self):
-        # Load supported languages from Azure (no auth required for /languages)
         def fetch_languages():
             resp = requests.get(
                 f"{self.endpoint}/languages",
@@ -274,20 +271,17 @@ class Engine:
             targets = {}
             sources = set()
             for code, info in data.items():
-                # Prefer our internal codes when possible
                 internal = FROM_AZURE.get(code) or FROM_AZURE.get(code.lower())
                 if internal:
                     targets[internal] = info.get("name", internal)
                     sources.add(family(internal))
                 else:
-                    # Fallback: keep Azure code upper-cased for unknown languages
-                    upper = code.upper().replace("-", "-")
+                    upper = code.upper()
                     targets[upper] = info.get("name", upper)
                     sources.add(family(upper))
             return targets, sources
 
         self.targets, self.sources = await asyncio.to_thread(fetch_languages)
-        # Ensure our preferred codes are present
         for code, name in LANGUAGES.items():
             self.targets.setdefault(code, name)
             self.sources.add(family(code))
@@ -393,9 +387,8 @@ engine = Engine()
 
 
 def embeds(message, result):
-    """Split long outputs without silently truncating the original translation."""
     text = result.text
-    chunks = [text[i : i + 3500] for i in range(0, len(text), 3500)] or ["(empty)"]
+    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or ["(empty)"]
     if len(chunks) > 10 or len(text) > 5400:
         raise ValueError("Translation exceeds Discord output limits.")
     output = []
@@ -404,11 +397,13 @@ def embeds(message, result):
             title=LANGUAGES.get(result.target, result.target),
             description=chunk,
             color=0xB05CC6,
-            url=message.jump_url,
+            url=message.jump_url if hasattr(message, "jump_url") else None,
         )
-        embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
-        if index == 0:
-            embed.set_thumbnail(url=message.author.display_avatar.url)
+        author_name = getattr(message.author, "display_name", "Unknown")
+        author_icon = getattr(getattr(message.author, "display_avatar", None), "url", None)
+        embed.set_author(name=author_name, icon_url=author_icon)
+        if index == 0 and author_icon:
+            embed.set_thumbnail(url=author_icon)
         embed.set_footer(
             text=f"Original language: {result.source} • Provider: Azure • {index + 1}/{len(chunks)}"
         )
@@ -430,24 +425,15 @@ class Tree(app_commands.CommandTree):
                 await interaction.response.defer(ephemeral=True, thinking=True)
             except discord.HTTPException as e:
                 log.warning("Could not defer interaction %s: %s", interaction.id, e)
-        # Do not initialize a language during read-only inspection
-        if (
-            interaction.command is None
-            or interaction.command.name != "checkuserlanguage"
-        ):
-            await store.user_language(
-                interaction.user.id,
-                interaction.locale.value,
-            )
+        if interaction.command is None or interaction.command.name != "checkuserlanguage":
+            await store.user_language(interaction.user.id, interaction.locale.value)
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         cause = getattr(error, "original", error)
         log.error("Slash command failed", exc_info=(type(cause), cause, cause.__traceback__))
-        if isinstance(cause, (ValueError, app_commands.CheckFailure)):
-            text = str(cause)
-        else:
-            text = "The operation failed. Check the bot logs, Azure quota, and Turso connection."
+        text = str(cause) if isinstance(cause, (ValueError, app_commands.CheckFailure)) else \
+            "The operation failed. Check the bot logs, Azure quota, and Turso connection."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(text, ephemeral=True)
@@ -456,18 +442,13 @@ class Tree(app_commands.CommandTree):
         except discord.HTTPException:
             log.warning("Could not send error message for interaction %s", interaction.id)
 
+
 class TranslateView(discord.ui.View):
-    """A stateless persistent button; the reply reference identifies its source."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Translate / 翻譯",
-        emoji=GLOBE,
-        custom_id="tr2:translate",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def translate_button(self, interaction, button):
+    @discord.ui.button(label="Translate / 翻譯", emoji=GLOBE, custom_id="tr2:translate", style=discord.ButtonStyle.secondary)
+    async def translate_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             target, _ = await store.user_language(interaction.user.id, interaction.locale.value)
@@ -488,10 +469,36 @@ class TranslateView(discord.ui.View):
             await private_error(interaction, str(error))
         except Exception:
             log.exception("Translation button failed")
-            await private_error(
-                interaction,
-                "Translation failed. The message may be deleted, or the provider unavailable.",
-            )
+            await private_error(interaction, "Translation failed. The message may be deleted, or the provider unavailable.")
+
+
+class ProxyTranslateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Translate", emoji="🌐", custom_id="tr2:proxy_translate", style=discord.ButtonStyle.secondary)
+    async def translate_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            target, _ = await store.user_language(interaction.user.id, interaction.locale.value)
+            content = interaction.message.content
+            if not content or not eligible(content):
+                raise ValueError("This message has no suitable text to translate.")
+            result = await engine.translate(content, target)
+            await interaction.followup.send(embeds=embeds(interaction.message, result), ephemeral=True)
+        except ValueError as e:
+            await private_error(interaction, str(e))
+        except Exception:
+            log.exception("Proxy translate button failed")
+            await private_error(interaction, "Translation failed.")
+
+
+async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
+    webhooks = await channel.webhooks()
+    for wh in webhooks:
+        if wh.name == "Translator Proxy" and wh.token:
+            return wh
+    return await channel.create_webhook(name="Translator Proxy", reason="Translation proxy messaging")
 
 
 class Bot(commands.Bot):
@@ -513,6 +520,7 @@ class Bot(commands.Bot):
         await engine.setup()
         await store.setup()
         self.add_view(TranslateView())
+        self.add_view(ProxyTranslateView())
         self.add_view(LanguageSelectView())
 
     def limited(self, key, seconds=5):
@@ -534,7 +542,7 @@ class Bot(commands.Bot):
 
 
 class LanguageSelect(discord.ui.Select):
-    FLAG_MAP = {
+    FLAG_MAP: ClassVar[dict[str, str]] = {
         "AR": "🇸🇦", "BG": "🇧🇬", "CS": "🇨🇿", "DA": "🇩🇰",
         "DE": "🇩🇪", "EL": "🇬🇷", "EN-US": "🇺🇸", "EN-GB": "🇬🇧",
         "ES": "🇪🇸", "ET": "🇪🇪", "FI": "🇫🇮", "FR": "🇫🇷",
@@ -551,13 +559,7 @@ class LanguageSelect(discord.ui.Select):
         options = []
         for code, name in sorted(LANGUAGES.items(), key=lambda x: x[1])[:25]:
             flag = self.FLAG_MAP.get(code, "🌐")
-            options.append(
-                discord.SelectOption(
-                    label=f"{flag} {name}"[:100],
-                    value=code
-                )
-            )
-
+            options.append(discord.SelectOption(label=f"{flag} {name}"[:100], value=code))
         super().__init__(
             placeholder="Choose your preferred language...",
             min_values=1,
@@ -578,11 +580,11 @@ class LanguageSelect(discord.ui.Select):
             ephemeral=True,
         )
 
+
 class LanguageSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(LanguageSelect())
-
 
 
 bot = Bot()
@@ -596,14 +598,6 @@ async def language_choices(interaction, current):
     ][:25]
 
 
-async def source_choices(interaction, current):
-    return [
-        app_commands.Choice(name=f"{LANGUAGES.get(c, c)} ({c})"[:100], value=c)
-        for c in sorted(engine.sources)
-        if current.casefold() in f"{c} {LANGUAGES.get(c, c)}".casefold()
-    ][:25]
-
-
 @bot.tree.command(description="Set your personal translation language.")
 @app_commands.autocomplete(language=language_choices)
 async def setselflanguage(interaction: discord.Interaction, language: str):
@@ -613,9 +607,7 @@ async def setselflanguage(interaction: discord.Interaction, language: str):
         "ON CONFLICT(user_id) DO UPDATE SET language=excluded.language,origin='manual'",
         (str(interaction.user.id), code),
     )
-    await interaction.followup.send(
-        f"Your language is now {LANGUAGES[code]} ({code}).", ephemeral=True
-    )
+    await interaction.followup.send(f"Your language is now {LANGUAGES[code]} ({code}).", ephemeral=True)
 
 
 @bot.tree.command(description="Show your assigned translation language.")
@@ -632,92 +624,74 @@ async def selflanguage(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.autocomplete(language=language_choices)
-async def setchannellanguage(
-    interaction: discord.Interaction, channel: discord.TextChannel, language: str
-):
+async def setchannellanguage(interaction: discord.Interaction, channel: discord.TextChannel, language: str):
     code = None if language.lower() == "off" else engine.target(language)
     await store.sql(
         "INSERT INTO tr2_channels(guild_id,channel_id,language) VALUES(?,?,?) "
         "ON CONFLICT(channel_id) DO UPDATE SET language=excluded.language",
         (str(interaction.guild_id), str(channel.id), code),
     )
-    await interaction.followup.send(
-        f"{channel.mention}: {code or 'automatic channel translation disabled'}.",
-        ephemeral=True,
-    )
+    await interaction.followup.send(f"{channel.mention}: {code or 'automatic channel translation disabled'}.", ephemeral=True)
 
 
 @bot.tree.command(description="Enable or disable globe reactions in a channel.")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setglobalchannel(
-    interaction: discord.Interaction, channel: discord.TextChannel, enabled: bool = True
-):
+async def setglobalchannel(interaction: discord.Interaction, channel: discord.TextChannel, enabled: bool = True):
     await store.sql(
         "INSERT INTO tr2_channels(guild_id,channel_id,is_global) VALUES(?,?,?) "
         "ON CONFLICT(channel_id) DO UPDATE SET is_global=excluded.is_global",
         (str(interaction.guild_id), str(channel.id), int(enabled)),
     )
+    await interaction.followup.send(f"{channel.mention}: global mode {'enabled' if enabled else 'disabled'}.", ephemeral=True)
+
+
+@bot.tree.command(description="Enable or disable proxy messaging (delete + re-post + translate button).")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setproxychannel(interaction: discord.Interaction, channel: discord.TextChannel, enabled: bool = True):
+    await store.sql(
+        "INSERT INTO tr2_channels(guild_id,channel_id,is_proxy) VALUES(?,?,?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET is_proxy=excluded.is_proxy",
+        (str(interaction.guild_id), str(channel.id), int(enabled)),
+    )
     await interaction.followup.send(
-        f"{channel.mention}: global mode {'enabled' if enabled else 'disabled'}.",
+        f"{channel.mention}: proxy messaging {'enabled' if enabled else 'disabled'}.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(
-    description="Translate a source language into a target; enabled:false removes the rule."
-)
+@bot.tree.command(description="Translate a source language into a target; enabled:false removes the rule.")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.autocomplete(
-    targeted_language=language_choices, translated_language=language_choices
-)
-async def translate(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    targeted_language: str,
-    translated_language: str,
-    enabled: bool = True,
-):
+@app_commands.autocomplete(targeted_language=language_choices, translated_language=language_choices)
+async def translate(interaction: discord.Interaction, channel: discord.TextChannel,
+                    targeted_language: str, translated_language: str, enabled: bool = True):
     source = engine.source(targeted_language)
     target = engine.target(translated_language)
-
     args = (str(interaction.guild_id), str(channel.id), source, target)
     if enabled:
         if family(source) == family(target):
             raise ValueError("Choose two different languages for a translation rule.")
         await store.sql("INSERT OR IGNORE INTO tr2_rules VALUES(?,?,?,?)", args)
     else:
-        await store.sql(
-            "DELETE FROM tr2_rules WHERE guild_id=? AND channel_id=? AND source=? AND target=?",
-            args,
-        )
-    await interaction.followup.send(
-        f"{channel.mention}: {source} → {target} {'enabled' if enabled else 'removed'}.",
-        ephemeral=True,
-    )
+        await store.sql("DELETE FROM tr2_rules WHERE guild_id=? AND channel_id=? AND source=? AND target=?", args)
+    await interaction.followup.send(f"{channel.mention}: {source} → {target} {'enabled' if enabled else 'removed'}.", ephemeral=True)
 
 
 @bot.tree.command(description="List channel languages, global channels and translation rules.")
 @app_commands.guild_only()
 async def listslanguage(interaction: discord.Interaction):
-    rows = await store.sql(
-        "SELECT channel_id,language,is_global FROM tr2_channels WHERE guild_id=?",
-        (str(interaction.guild_id),),
-    )
-    rules = await store.sql(
-        "SELECT channel_id,source,target FROM tr2_rules WHERE guild_id=? ORDER BY channel_id,source,target",
-        (str(interaction.guild_id),),
-    )
+    rows = await store.sql("SELECT channel_id,language,is_global,is_proxy FROM tr2_channels WHERE guild_id=?", (str(interaction.guild_id),))
+    rules = await store.sql("SELECT channel_id,source,target FROM tr2_rules WHERE guild_id=? ORDER BY channel_id,source,target", (str(interaction.guild_id),))
     lines = ["Channel settings:"]
-    for cid, language, glob in rows:
+    for cid, language, glob, proxy in rows:
         channel = interaction.guild.get_channel(int(cid))
         if channel and channel.permissions_for(interaction.user).view_channel:
-            lines.append(
-                f"{channel.mention}: language={language or 'none'}; global={bool(glob)}"
-            )
+            lines.append(f"{channel.mention}: language={language or 'none'}; global={bool(glob)}; proxy={bool(proxy)}")
     lines.append("Translation rules:")
     for cid, source, target in rules:
         channel = interaction.guild.get_channel(int(cid))
@@ -732,12 +706,7 @@ async def listslanguage(interaction: discord.Interaction):
     pages.append(page)
     if len(pages) > 4:
         import io
-        await interaction.followup.send(
-            file=discord.File(
-                io.BytesIO("\n".join(lines).encode()), filename="channel-settings.txt"
-            ),
-            ephemeral=True,
-        )
+        await interaction.followup.send(file=discord.File(io.BytesIO("\n".join(lines).encode()), filename="channel-settings.txt"), ephemeral=True)
     else:
         for page in pages:
             await interaction.followup.send(page, ephemeral=True)
@@ -748,22 +717,15 @@ async def listslanguage(interaction: discord.Interaction):
 @commands.guild_only()
 @commands.max_concurrency(1, per=commands.BucketType.default, wait=False)
 async def sync_commands(ctx: commands.Context):
-    """Publish current global commands and clear legacy commands in this server."""
     tree = ctx.bot.tree
     if not tree.get_commands(guild=None):
-        await ctx.reply(
-            "Sync cancelled: no global commands are loaded.",
-            mention_author=False,
-        )
+        await ctx.reply("Sync cancelled: no global commands are loaded.", mention_author=False)
         return
     try:
         synced = await tree.sync()
     except discord.HTTPException:
         log.exception("Global command sync failed")
-        await ctx.reply(
-            "Global sync failed. Check the bot logs.",
-            mention_author=False,
-        )
+        await ctx.reply("Global sync failed. Check the bot logs.", mention_author=False)
         return
     previous_guild_commands = tree.get_commands(guild=ctx.guild)
     try:
@@ -773,17 +735,9 @@ async def sync_commands(ctx: commands.Context):
         for command in previous_guild_commands:
             tree.add_command(command, guild=ctx.guild, override=True)
         log.exception("Legacy command cleanup failed in guild %s", ctx.guild.id)
-        await ctx.reply(
-            f"Published {len(synced)} global commands, but could not clear "
-            "the old server-specific commands. Check the logs and retry !sync.",
-            mention_author=False,
-        )
+        await ctx.reply(f"Published {len(synced)} global commands, but could not clear old server-specific commands.", mention_author=False)
         return
-    await ctx.reply(
-        f"Published {len(synced)} global commands and cleared this bot's "
-        "old server-specific slash/context-menu commands in this server.",
-        mention_author=False,
-    )
+    await ctx.reply(f"Published {len(synced)} global commands and cleared old server-specific commands.", mention_author=False)
 
 
 @bot.event
@@ -791,22 +745,15 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.NotOwner):
-        await ctx.reply(
-            "Only the bot application owner can run !sync.", mention_author=False
-        )
+        await ctx.reply("Only the bot application owner can run !sync.", mention_author=False)
     else:
-        log.error(
-            "Prefix command failed",
-            exc_info=(type(error), error, error.__traceback__),
-        )
+        log.error("Prefix command failed", exc_info=(type(error), error, error.__traceback__))
         await ctx.reply("Command failed; check the bot logs.", mention_author=False)
 
 
 @bot.event
 async def on_ready():
-    log.info(
-        "Online as %s. Run !sync as the bot owner to publish commands.", bot.user
-    )
+    log.info("Online as %s. Run !sync as the bot owner to publish commands.", bot.user)
 
 
 @bot.event
@@ -833,64 +780,83 @@ async def on_member_join(member):
 
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id:
         return
     await bot.process_commands(message)
     if not message.guild:
         return
+
     try:
         await store.user_language(message.author.id)
         cid = str(message.channel.id)
+
         settings = await store.sql(
-            "SELECT language,is_global FROM tr2_channels WHERE channel_id=?", (cid,)
+            "SELECT language, is_global, is_proxy FROM tr2_channels WHERE channel_id=?",
+            (cid,),
         )
-        language, glob = settings[0] if settings else (None, 0)
+        language, glob, is_proxy = settings[0] if settings else (None, 0, 0)
+
+        # ----- Proxy Messaging -----
+        if is_proxy and eligible(message.content) and not message.attachments:
+            try:
+                perms = message.channel.permissions_for(message.guild.me)
+                if perms.manage_messages and perms.manage_webhooks:
+                    webhook = await get_or_create_webhook(message.channel)
+                    await message.delete()
+                    await webhook.send(
+                        content=message.content,
+                        username=message.author.display_name,
+                        avatar_url=message.author.display_avatar.url,
+                        view=ProxyTranslateView(),
+                        wait=True,
+                    )
+                    return
+            except Exception:
+                log.exception("Proxy messaging failed for message %s", message.id)
+
+        # ----- Normal logic -----
         if glob and eligible(message.content):
             try:
                 await message.add_reaction(GLOBE)
             except discord.HTTPException:
                 log.warning("Cannot add global reaction in channel %s", cid)
+
         if not eligible(message.content):
             return
+
         rules = await store.sql(
-            "SELECT source,target FROM tr2_rules WHERE channel_id=? ORDER BY source,target",
+            "SELECT source, target FROM tr2_rules WHERE channel_id=? ORDER BY source, target",
             (cid,),
         )
         if not language and not rules:
             return
+
         probe_target = language or rules[0][1]
         probe = await engine.translate(message.content, probe_target)
+
         targets = set()
         if language and family(language) != family(probe.source):
             targets.add(language)
         targets.update(
-            target
-            for source, target in rules
-            if family(source) == family(probe.source)
-            and family(target) != family(probe.source)
+            target for source, target in rules
+            if family(source) == family(probe.source) and family(target) != family(probe.source)
         )
+
         for target in sorted(targets):
             try:
-                result = (
-                    probe if target == probe_target
-                    else await engine.translate(message.content, target)
-                )
+                result = probe if target == probe_target else await engine.translate(message.content, target)
                 if unchanged_translation(message.content, result.text):
                     continue
-
                 try:
                     await message.reply(embeds=embeds(message, result), mention_author=False)
                 except discord.HTTPException as e:
-                    # 429, 500, Forbidden, etc. – just log briefly
-                    log.warning(
-                        "Failed to send translation reply in channel %s: %s",
-                        message.channel.id, e
-                    )
+                    log.warning("Failed to send translation reply in channel %s: %s", message.channel.id, e)
             except Exception:
                 log.exception("Automatic translation target %s failed", target)
+
     except Exception:
-            log.exception("Message processing failed for %s", message.id)
+        log.exception("Message processing failed for %s", message.id)
 
 
 @bot.event
@@ -907,9 +873,7 @@ async def on_raw_reaction_add(payload):
         member = payload.member or await guild.fetch_member(payload.user_id)
         if member.bot:
             return
-        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(
-            payload.channel_id
-        )
+        channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
         perms = channel.permissions_for(member)
         if not (perms.view_channel and perms.read_message_history):
             return
@@ -920,17 +884,11 @@ async def on_raw_reaction_add(payload):
         if original.author.bot or original.webhook_id:
             return
         if symbol == GLOBE:
-            settings = await store.sql(
-                "SELECT is_global FROM tr2_channels WHERE channel_id=?",
-                (str(channel.id),),
-            )
+            settings = await store.sql("SELECT is_global FROM tr2_channels WHERE channel_id=?", (str(channel.id),))
             if not settings or not settings[0][0]:
                 return
             async with bot.prompt_lock:
-                rows = await store.sql(
-                    "SELECT prompt_id FROM tr2_prompts WHERE original_id=?",
-                    (str(original.id),),
-                )
+                rows = await store.sql("SELECT prompt_id FROM tr2_prompts WHERE original_id=?", (str(original.id),))
                 if rows:
                     try:
                         await channel.fetch_message(int(rows[0][0]))
@@ -962,37 +920,23 @@ async def on_raw_reaction_add(payload):
         log.exception("Reaction translation failed for message %s", payload.message_id)
 
 
-@bot.tree.command(
-    name="checkuserlanguage",
-    description="Administrator: check a member's assigned translation language.",
-)
+@bot.tree.command(name="checkuserlanguage", description="Administrator: check a member's assigned translation language.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(user="Member whose assigned language you want to check")
 async def checkuserlanguage(interaction: discord.Interaction, user: discord.Member):
-    """Read the stored language without creating an assignment for the target."""
-    rows = await store.sql(
-        "SELECT language FROM tr2_users WHERE user_id = ?",
-        (str(user.id),),
-    )
+    rows = await store.sql("SELECT language FROM tr2_users WHERE user_id = ?", (str(user.id),))
     if not rows or rows[0][0] is None:
         await interaction.followup.send("NULL", ephemeral=True)
         return
     language = rows[0][0]
-    await interaction.followup.send(
-        f"{user.mention}: {LANGUAGES.get(language, language)} (`{language}`)",
-        ephemeral=True,
-    )
+    await interaction.followup.send(f"{user.mention}: {LANGUAGES.get(language, language)} (`{language}`)", ephemeral=True)
 
-@bot.tree.command(
-    name="sendlanguagerequest",
-    description="Administrator: send a language selection DM to a member.",
-)
+
+@bot.tree.command(name="sendlanguagerequest", description="Administrator: send a language selection DM to a member.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
-@app_commands.describe(user="Member to send the language selection request to")
 async def sendlanguagerequest(interaction: discord.Interaction, user: discord.Member):
     if user.bot:
         raise ValueError("Cannot send a language request to a bot.")
@@ -1008,14 +952,9 @@ async def sendlanguagerequest(interaction: discord.Interaction, user: discord.Me
             color=0xB05CC6,
         )
         await user.send(embed=embed, view=LanguageSelectView())
-        await interaction.followup.send(
-            f"Successfully sent language selection request to {user.mention}.",
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"Successfully sent language selection request to {user.mention}.", ephemeral=True)
     except discord.Forbidden:
         raise ValueError(f"Could not send DM to {user.mention}. Their DMs might be closed.")
-
-
 
 
 if __name__ == "__main__":
