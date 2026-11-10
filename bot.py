@@ -168,6 +168,7 @@ class Store:
             )""",
             "CREATE TABLE IF NOT EXISTS tr2_rules (guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY(channel_id,source,target))",
             "CREATE TABLE IF NOT EXISTS tr2_prompts (original_id TEXT PRIMARY KEY, prompt_id TEXT NOT NULL, channel_id TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS tr2_welcome (guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL)",
         ]
         for statement in statements:
             await self.sql(statement)
@@ -193,6 +194,20 @@ class Store:
             (str(uid), language, origin),
         )
         return (await self.sql("SELECT language,origin FROM tr2_users WHERE user_id=?", (str(uid),)))[0]
+
+    async def set_welcome_channel(self, guild_id: int, channel_id: int):
+        await self.sql(
+            "INSERT INTO tr2_welcome(guild_id, channel_id) VALUES(?,?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id",
+            (str(guild_id), str(channel_id)),
+        )
+
+    async def get_welcome_channel(self, guild_id: int) -> int | None:
+        rows = await self.sql(
+            "SELECT channel_id FROM tr2_welcome WHERE guild_id=?",
+            (str(guild_id),),
+        )
+        return int(rows[0][0]) if rows else None
 
     async def close(self):
         if self.conn:
@@ -757,7 +772,7 @@ async def on_ready():
 
 
 @bot.event
-async def on_member_join(member):
+async def on_member_join(member: discord.Member):
     if member.bot:
         return
     await store.user_language(member.id)
@@ -778,6 +793,18 @@ async def on_member_join(member):
     except Exception:
         log.exception("Failed to send language selection DM to %s", member.id)
 
+    try:
+        channel_id = await store.get_welcome_channel(member.guild.id)
+        if channel_id:
+            channel = member.guild.get_channel(channel_id)
+            if channel:
+                await channel.send(
+                    f"{member.mention} Welcome to the server! 🎉\n"
+                    f"You can use `/help` to see how the translation bot works."
+                )
+    except Exception:
+        log.exception("Failed to send welcome message for %s", member.id)
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -797,7 +824,6 @@ async def on_message(message: discord.Message):
         )
         language, glob, is_proxy = settings[0] if settings else (None, 0, 0)
 
-        # ----- Proxy Messaging -----
         if is_proxy and eligible(message.content) and not message.attachments:
             try:
                 perms = message.channel.permissions_for(message.guild.me)
@@ -815,7 +841,6 @@ async def on_message(message: discord.Message):
             except Exception:
                 log.exception("Proxy messaging failed for message %s", message.id)
 
-        # ----- Normal logic -----
         if glob and eligible(message.content):
             try:
                 await message.add_reaction(GLOBE)
@@ -956,6 +981,47 @@ async def sendlanguagerequest(interaction: discord.Interaction, user: discord.Me
     except discord.Forbidden:
         raise ValueError(f"Could not send DM to {user.mention}. Their DMs might be closed.")
 
+@bot.tree.command(description="Set the channel where new members will be welcomed.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setwelcome(interaction: discord.Interaction, channel: discord.TextChannel):
+    await store.set_welcome_channel(interaction.guild_id, channel.id)
+    await interaction.followup.send(
+        f"Welcome channel set to {channel.mention}.", ephemeral=True
+    )
+@bot.tree.command(description="Show how to use the translation bot.")
+async def help(interaction: discord.Interaction):
+    lang_code, _ = await store.user_language(interaction.user.id, interaction.locale.value)
+    original_text = (
+        "This bot helps everyone chat across different languages.\n\n"
+        "**How it works**\n"
+        "• You can change your personal language anytime with `/setselflanguage`.\n"
+        "• Check your current language with `/selflanguage`.\n\n"
+        "**Using translations**\n"
+        "• In some channels the bot may automatically translate messages.\n"
+        "• You can also react with a country flag to receive a private translation in that language.\n"
+        "• In channels with the 🌐 reaction, click the **Translate** button to get a private translation in your language.\n\n"
+        "**Commands you can use**\n"
+        "`/setselflanguage` – Set your preferred language\n"
+        "`/selflanguage` – Check your current language\n"
+        "`/help` – Show this help message"
+    )
+    try:
+        if family(lang_code) != "EN":
+            result = await engine.translate(original_text, lang_code)
+            help_text = result.text
+            title = f"🌐 {LANGUAGES.get(lang_code, lang_code)} Help"
+        else:
+            help_text = original_text
+            title = "🌐 Translation Bot Help"
+    except Exception:
+        help_text = original_text
+        title = "🌐 Translation Bot Help"
+
+    embed = discord.Embed(title=title, description=help_text, color=0xB05CC6)
+    embed.set_footer(text="Provider: Azure Translator")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN, log_handler=None)
