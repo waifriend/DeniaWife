@@ -534,11 +534,30 @@ class Bot(commands.Bot):
 
 
 class LanguageSelect(discord.ui.Select):
+    FLAG_MAP = {
+        "AR": "🇸🇦", "BG": "🇧🇬", "CS": "🇨🇿", "DA": "🇩🇰",
+        "DE": "🇩🇪", "EL": "🇬🇷", "EN-US": "🇺🇸", "EN-GB": "🇬🇧",
+        "ES": "🇪🇸", "ET": "🇪🇪", "FI": "🇫🇮", "FR": "🇫🇷",
+        "HE": "🇮🇱", "HI": "🇮🇳", "HU": "🇭🇺", "ID": "🇮🇩",
+        "IT": "🇮🇹", "JA": "🇯🇵", "KO": "🇰🇷", "LT": "🇱🇹",
+        "LV": "🇱🇻", "NB": "🇳🇴", "NL": "🇳🇱", "PL": "🇵🇱",
+        "PT-BR": "🇧🇷", "PT-PT": "🇵🇹", "RO": "🇷🇴", "RU": "🇷🇺",
+        "SK": "🇸🇰", "SL": "🇸🇮", "SV": "🇸🇪", "TH": "🇹🇭",
+        "TR": "🇹🇷", "UK": "🇺🇦", "VI": "🇻🇳",
+        "ZH-HANS": "🇨🇳", "ZH-HANT": "🇹🇼",
+    }
+
     def __init__(self):
-        options = [
-            discord.SelectOption(label=name[:100], value=code)
-            for code, name in sorted(LANGUAGES.items(), key=lambda x: x[1])[:25]
-        ]
+        options = []
+        for code, name in sorted(LANGUAGES.items(), key=lambda x: x[1])[:25]:
+            flag = self.FLAG_MAP.get(code, "🌐")
+            options.append(
+                discord.SelectOption(
+                    label=f"{flag} {name}"[:100],
+                    value=code
+                )
+            )
+
         super().__init__(
             placeholder="Choose your preferred language...",
             min_values=1,
@@ -558,7 +577,6 @@ class LanguageSelect(discord.ui.Select):
             f"Your language has been set to {LANGUAGES.get(code, code)} (`{code}`).",
             ephemeral=True,
         )
-
 
 class LanguageSelectView(discord.ui.View):
     def __init__(self):
@@ -798,8 +816,13 @@ async def on_member_join(member):
     await store.user_language(member.id)
     try:
         embed = discord.Embed(
-            title="Welcome! Please choose your language",
-            description="Please select your preferred translation language using the dropdown menu below.",
+            title="🌐 Language Selection / 言語選択 / 语言选择 / 언어 선택",
+            description=(
+                "**Please select your preferred translation language using the dropdown menu below.**\n"
+                "**ドロップダウンメニューから希望の翻訳言語を選択してください。**\n"
+                "**请使用下面的下拉菜单选择您的首选翻译语言。**\n"
+                "**아래 드롭다운 메뉴에서 선호하는 번역 언어를 선택하세요.**"
+            ),
             color=0xB05CC6,
         )
         await member.send(embed=embed, view=LanguageSelectView())
@@ -823,7 +846,7 @@ async def on_message(message):
             "SELECT language,is_global FROM tr2_channels WHERE channel_id=?", (cid,)
         )
         language, glob = settings[0] if settings else (None, 0)
-        if glob:
+        if glob and eligible(message.content):
             try:
                 await message.add_reaction(GLOBE)
             except discord.HTTPException:
@@ -975,8 +998,13 @@ async def sendlanguagerequest(interaction: discord.Interaction, user: discord.Me
         raise ValueError("Cannot send a language request to a bot.")
     try:
         embed = discord.Embed(
-            title="Language Selection Request",
-            description="Please select your preferred translation language using the dropdown menu below.",
+            title="🌐 Language Selection / 言語選択 / 语言选择 / 언어 선택",
+            description=(
+                "**Please select your preferred translation language using the dropdown menu below.**\n"
+                "**ドロップダウンメニューから希望の翻訳言語を選択してください。**\n"
+                "**请使用下面的下拉菜单选择您的首选翻译语言。**\n"
+                "**아래 드롭다운 메뉴에서 선호하는 번역 언어를 선택하세요.**"
+            ),
             color=0xB05CC6,
         )
         await user.send(embed=embed, view=LanguageSelectView())
